@@ -14145,10 +14145,10 @@ index 36194fdbd119d73d62bf..ca4e5e41e23935c0978e 100644
  #[path = "tests/luna_reserve_usage_tests.rs"]
 diff --git a/codex-rs/tui/src/chatwidget/tests/heads_up_tests.rs b/codex-rs/tui/src/chatwidget/tests/heads_up_tests.rs
 new file mode 100644
-index 00000000000000000000..665cdc205e35d7697967
+index 00000000000000000000..e3f530489c5346a0233c
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/tests/heads_up_tests.rs
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,507 @@
 +use super::*;
 +use crate::heads_up::HeadsUpAction;
 +use codex_app_server_protocol::ThreadHeadsUpFinding;
@@ -14300,7 +14300,10 @@ index 00000000000000000000..665cdc205e35d7697967
 +    chat.on_heads_up_result(thread_id, old_generation, Ok(Some(finding())));
 +    assert!(chat.heads_up.note.is_none());
 +    chat.toggle_heads_up();
-+    let (_, generation, _) = next_review(&mut rx).expect("new review after enabling");
++    assert!(next_review(&mut rx).is_none());
++    chat.heads_up_step_completed();
++    chat.heads_up_turn_completed();
++    let (_, generation, _) = next_review(&mut rx).expect("new review after fresh work");
 +    chat.on_heads_up_result(thread_id, old_generation, Ok(Some(finding())));
 +    assert_eq!(
 +        chat.heads_up.pending,
