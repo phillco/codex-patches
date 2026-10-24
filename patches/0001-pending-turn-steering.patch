@@ -1,0 +1,858 @@
+diff --git a/codex-rs/tui/src/app/tests/turn_submission.rs b/codex-rs/tui/src/app/tests/turn_submission.rs
+index a81fdf02f148a9e7246a..d850d9a2df4e0e2f83d7 100644
+--- a/codex-rs/tui/src/app/tests/turn_submission.rs
++++ b/codex-rs/tui/src/app/tests/turn_submission.rs
+@@ -1,7 +1,9 @@
+ use super::*;
++use crate::app_server_session::ThreadParamsMode;
+ use crate::chatwidget::UserMessage;
+ use codex_app_server_protocol::CodexErrorInfo;
+ use codex_app_server_protocol::ErrorNotification;
++use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+ use codex_app_server_protocol::ThreadGoalStatus;
+ use codex_protocol::models::ManagedFileSystemPermissions;
+ use codex_protocol::permissions::FileSystemAccessMode;
+@@ -10,6 +12,108 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
+ use codex_protocol::permissions::FileSystemSpecialPath;
+ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use pretty_assertions::assert_eq;
++use serde_json::json;
++use tokio::net::TcpListener;
++
++use super::disconnect::serve_reconnect_requests;
++
++#[tokio::test]
++async fn early_enter_steers_before_turn_started_and_preserves_retry_prompt() -> Result<()> {
++    let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
++    let thread_id = ThreadId::new();
++    app.active_thread_id = Some(thread_id);
++    app.primary_thread_id = Some(thread_id);
++    app.chat_widget
++        .handle_thread_session(test_thread_session(thread_id, app.config.cwd.to_path_buf()));
++    let listener = TcpListener::bind("127.0.0.1:0").await?;
++    let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
++    app.app_server_target = AppServerTarget::Remote {
++        endpoint: endpoint.clone(),
++    };
++    let server = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await?;
++        serve_reconnect_requests(tokio_tungstenite::accept_async(stream).await?, |request| {
++            // Deliberately emit no TurnStarted notification before the next user submission.
++            std::future::ready(Some(match request.method.as_str() {
++                "turn/start" => json!({"result": {
++                    "turn": test_turn("early-turn", TurnStatus::InProgress, Vec::new())
++                }}),
++                "turn/steer" => {
++                    let params = request.params.expect("steer params");
++                    assert_eq!(params["expectedTurnId"], json!("early-turn"));
++                    assert_eq!(
++                        params["input"],
++                        json!([{
++                            "type": "text", "text": "early steer", "text_elements": []
++                        }])
++                    );
++                    json!({"result": {"turnId": "early-turn"}})
++                }
++                method => panic!("unexpected request: {method}"),
++            }))
++        })
++        .await
++    });
++    let mut session = AppServerSession::new(
++        crate::connect_remote_app_server(endpoint).await?,
++        ThreadParamsMode::Remote,
++    );
++
++    app.chat_widget
++        .apply_external_edit("original request".into());
++    app.chat_widget
++        .handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let original = next_user_turn_op(&mut ops);
++    app.submit_thread_op(&mut session, thread_id, original.clone())
++        .await?;
++    assert_eq!(
++        app.active_turn_id_for_thread(thread_id).await,
++        Some("early-turn".into())
++    );
++    app.chat_widget.apply_external_edit("early steer".into());
++    app.chat_widget
++        .handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let steer = next_user_turn_op(&mut ops);
++    app.submit_thread_op(&mut session, thread_id, steer).await?;
++
++    // Once the delayed start arrives, retry must still refer to the original request.
++    app.chat_widget.handle_server_notification(
++        turn_started_notification(thread_id, "early-turn"),
++        /*replay_kind*/ None,
++    );
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ModelSafetyBufferingUpdated(ModelSafetyBufferingUpdatedNotification {
++            thread_id: thread_id.to_string(),
++            turn_id: "early-turn".into(),
++            model: app
++                .config
++                .model
++                .clone()
++                .unwrap_or_else(|| "gpt-test".into()),
++            use_cases: Vec::new(),
++            reasons: Vec::new(),
++            show_buffering_ui: true,
++            faster_model: Some("gpt-test-fast".into()),
++        }),
++        /*replay_kind*/ None,
++    );
++    app.chat_widget
++        .handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let retry = std::iter::from_fn(|| events.try_recv().ok())
++        .find_map(|event| match event {
++            AppEvent::ConfirmSafetyBufferedRetry { turn, prompt, .. } => Some((turn, prompt)),
++            _ => None,
++        })
++        .expect("retry confirmation for the original request");
++    assert_eq!(retry, (original, UserMessage::from("original request")));
++
++    session.shutdown().await?;
++    assert_eq!(
++        server.await??,
++        vec!["initialize", "turn/start", "turn/steer"]
++    );
++    Ok(())
++}
+ 
+ #[tokio::test]
+ async fn worktree_creation_event_requires_feature() -> Result<()> {
+@@ -359,6 +463,15 @@ async fn misalignment_policy_in_parent_stops_active_side_conversation() -> Resul
+ 
+ #[tokio::test]
+ async fn unsupported_legacy_permissions_are_shown_without_exiting() -> Result<()> {
++    unsupported_legacy_permissions_with_follow_up(KeyCode::Tab).await
++}
++
++#[tokio::test]
++async fn unsupported_legacy_permissions_preserve_early_steer_without_exiting() -> Result<()> {
++    unsupported_legacy_permissions_with_follow_up(KeyCode::Enter).await
++}
++
++async fn unsupported_legacy_permissions_with_follow_up(key: KeyCode) -> Result<()> {
+     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+     let mut tui = crate::tui::test_support::make_test_tui()?;
+     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+@@ -412,8 +525,8 @@ async fn unsupported_legacy_permissions_are_shown_without_exiting() -> Result<()
+     app.chat_widget
+         .restore_user_message_to_composer(UserMessage::from("queued follow-up"));
+     app.chat_widget
+-        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-    assert!(app.chat_widget.has_queued_follow_up_messages());
++        .handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
++    let early_steer = (key == KeyCode::Enter).then(|| next_user_turn_op(&mut op_rx));
+     while let Ok(event) = app_event_rx.try_recv() {
+         app.handle_event(&mut tui, &mut app_server, event).await?;
+     }
+@@ -423,6 +536,16 @@ async fn unsupported_legacy_permissions_are_shown_without_exiting() -> Result<()
+         .await?;
+ 
+     assert!(matches!(control, AppRunControl::Continue));
++    if let Some(steer) = early_steer {
++        let control = app
++            .handle_event(&mut tui, &mut app_server, AppEvent::CodexOp(steer))
++            .await?;
++        assert!(matches!(control, AppRunControl::Continue));
++        assert_eq!(
++            app.chat_widget.queued_user_message_texts(),
++            vec!["hello", "queued follow-up"]
++        );
++    }
+     assert!(app.chat_widget.has_queued_follow_up_messages());
+     let error_cell = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+         .find_map(|event| match event {
+@@ -458,7 +581,23 @@ async fn unsupported_legacy_permissions_are_shown_without_exiting() -> Result<()
+         AppEvent::SettingsSelectionSettled,
+     )
+     .await?;
++    let Op::UserTurn { items, .. } = next_user_turn_op(&mut op_rx) else {
++        unreachable!("retried user turn");
++    };
++    let expected_prompt = if key == KeyCode::Enter {
++        // The rejected request and its early steer remain one request on retry.
++        "hello\nqueued follow-up"
++    } else {
++        "queued follow-up"
++    };
+     assert!(!app.chat_widget.has_queued_follow_up_messages());
++    assert_eq!(
++        items,
++        vec![UserInput::Text {
++            text: expected_prompt.into(),
++            text_elements: Vec::new(),
++        }]
++    );
+ 
+     app_server.shutdown().await?;
+     Ok(())
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index d9ea5f126b4994b5fc34..aeb62f0490a48462e13d 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -879,6 +879,13 @@ impl App {
+                             final_output_json_schema.clone(),
+                         )
+                         .await?;
++                    // The reply can precede TurnStarted. Route another Enter to turn/steer
++                    // immediately without replacing the original safety-buffered retry prompt.
++                    self.ensure_thread_channel(thread_id)
++                        .store
++                        .lock()
++                        .await
++                        .set_active_turn_id(response.turn.id.clone());
+                     if self.active_thread_id == Some(thread_id)
+                         && self.chat_widget.thread_id() == Some(thread_id)
+                     {
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index b5639c05e2e9ba4a0325..1fe988037ab2b52e4b76 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -85,8 +85,8 @@
+ //!
+ //! # Submission and Prompt Expansion
+ //!
+-//! `Enter` submits immediately. `Tab` requests queuing while a task is running; if no task is
+-//! running, `Tab` submits just like Enter so input is never dropped.
++//! `Enter` submits immediately. `Tab` requests queuing while a task is running or a regular
++//! turn start is pending; otherwise `Tab` submits just like Enter so input is never dropped.
+ //! Vim Replace shares Insert's composer actions; only textarea editing differs.
+ //! Literal completion/paste edits discard stale Replace recovery; subsequent typing records anew.
+ //! Token markers added during Replace are removed when restoring overwritten characters.
+@@ -538,6 +538,7 @@ pub(crate) struct ChatComposer {
+     placeholder_text: String,
+     blocks_direct_input: bool,
+     is_task_running: bool,
++    turn_start_pending: bool,
+     queue_submissions: bool,
+     /// Slash-command draft staged for local recall after application-level dispatch.
+     ///
+@@ -708,6 +709,7 @@ impl ChatComposer {
+             placeholder_text,
+             blocks_direct_input: false,
+             is_task_running: false,
++            turn_start_pending: false,
+             queue_submissions: false,
+             pending_slash_command_history: None,
+             skills: None,
+@@ -3559,9 +3561,14 @@ impl ChatComposer {
+             self.footer.mode = reset_mode_after_activity(self.footer.mode);
+         }
+         if self.queue_keys.is_pressed(key_event)
+-            && (self.is_task_running || self.queue_submissions || !self.is_bang_shell_command())
++            && (self.is_task_running
++                || self.turn_start_pending
++                || self.queue_submissions
++                || !self.is_bang_shell_command())
+         {
+-            return self.handle_submission(self.is_task_running || self.queue_submissions);
++            return self.handle_submission(
++                self.is_task_running || self.turn_start_pending || self.queue_submissions,
++            );
+         }
+ 
+         if self.submit_keys.is_pressed(key_event) {
+@@ -3904,7 +3911,7 @@ impl ChatComposer {
+             esc_backtrack_hint: self.footer.esc_backtrack_hint,
+             use_shift_enter_hint: self.footer.use_shift_enter_hint,
+             is_task_running: self.is_task_running,
+-            queue_submissions: self.queue_submissions,
++            queue_submissions: self.queue_submissions || self.turn_start_pending,
+             quit_shortcut_key: self.footer.quit_shortcut_key,
+             collaboration_modes_enabled: self.collaboration_modes_enabled,
+             is_wsl,
+@@ -4415,6 +4422,10 @@ impl ChatComposer {
+         self.is_task_running = running;
+     }
+ 
++    pub(crate) fn set_turn_start_pending(&mut self, pending: bool) {
++        self.turn_start_pending = pending;
++    }
++
+     pub(crate) fn set_queue_submissions(&mut self, queue_submissions: bool) {
+         self.queue_submissions = queue_submissions;
+     }
+@@ -4710,7 +4721,9 @@ impl ChatComposer {
+                     | FooterMode::EscHint => false,
+                 };
+                 let show_queue_hint = match footer_props.mode {
+-                    FooterMode::ComposerHasDraft => footer_props.is_task_running,
++                    FooterMode::ComposerHasDraft => {
++                        footer_props.is_task_running || footer_props.queue_submissions
++                    }
+                     FooterMode::HistorySearch
+                     | FooterMode::QuitShortcutReminder
+                     | FooterMode::ComposerEmpty
+diff --git a/codex-rs/tui/src/bottom_pane/footer.rs b/codex-rs/tui/src/bottom_pane/footer.rs
+index d5cbd0906794e2d37ae9..929c8773697e3c3e9fbf 100644
+--- a/codex-rs/tui/src/bottom_pane/footer.rs
++++ b/codex-rs/tui/src/bottom_pane/footer.rs
+@@ -230,7 +230,7 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
+         | FooterMode::EscHint => false,
+     };
+     let show_queue_hint = match props.mode {
+-        FooterMode::ComposerHasDraft => props.is_task_running,
++        FooterMode::ComposerHasDraft => props.is_task_running || props.queue_submissions,
+         FooterMode::QuitShortcutReminder
+         | FooterMode::HistorySearch
+         | FooterMode::ComposerEmpty
+@@ -827,7 +827,7 @@ pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'st
+ pub(crate) fn shows_passive_footer_line(props: &FooterProps) -> bool {
+     match props.mode {
+         FooterMode::ComposerEmpty => true,
+-        FooterMode::ComposerHasDraft => !props.is_task_running,
++        FooterMode::ComposerHasDraft => !props.is_task_running && !props.queue_submissions,
+         FooterMode::HistorySearch
+         | FooterMode::QuitShortcutReminder
+         | FooterMode::ShortcutOverlay
+@@ -1400,7 +1400,9 @@ mod tests {
+                     | FooterMode::EscHint => false,
+                 };
+                 let show_queue_hint = match props.mode {
+-                    FooterMode::ComposerHasDraft => props.is_task_running,
++                    FooterMode::ComposerHasDraft => {
++                        props.is_task_running || props.queue_submissions
++                    }
+                     FooterMode::HistorySearch
+                     | FooterMode::QuitShortcutReminder
+                     | FooterMode::ComposerEmpty
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 8c75f87b39647c92a45b..0e7924968f4330bf9bd1 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1230,6 +1230,10 @@ impl BottomPane {
+         self.composer.set_queue_submissions(queue_submissions);
+     }
+ 
++    pub(crate) fn set_turn_start_pending(&mut self, pending: bool) {
++        self.composer.set_turn_start_pending(pending);
++    }
++
+     /// Hide the status indicator while leaving task-running state untouched.
+     pub(crate) fn hide_status_indicator(&mut self) {
+         if self.status.take().is_some() {
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 4e345366999e7731847c..7e0ee52b1055a0070c9d 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -346,6 +346,7 @@ use self::ide_context::IdeContextState;
+ mod input_queue;
+ mod reconnect;
+ use self::input_queue::InputQueueState;
++use self::input_queue::PendingStartKind;
+ mod input_flow;
+ mod input_restore;
+ mod input_submission;
+@@ -1883,6 +1884,8 @@ impl ChatWidget {
+         ) {
+             self.transcript.last_status_copy_targets = None;
+             self.input_queue.user_turn_pending_start = true;
++            self.input_queue.pending_start_kind = PendingStartKind::Command;
++            self.bottom_pane.set_turn_start_pending(/*pending*/ false);
+         }
+         if matches!(op, AppCommand::Interrupt) && self.turn_lifecycle.agent_turn_running {
+             if let Some(controller) = self.stream_controller.as_mut() {
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index d6ad6077440121994656..52eba20715b3d8050d3d 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -37,7 +37,9 @@ impl ChatWidget {
+                     && !self.input_queue.suppress_queue_autosend
+                     && !self.input_queue.rate_limit_recovery_pending
+                     && (!self.input_queue.user_turn_pending_start
+-                        || self.turn_lifecycle.agent_turn_running);
++                        || self.turn_lifecycle.agent_turn_running
++                        || self.input_queue.can_steer_pending_start()
++                            && !user_message.text.starts_with('!'));
+                 if should_submit_now {
+                     if self.only_user_shell_commands_running()
+                         && !user_message.text.starts_with('!')
+diff --git a/codex-rs/tui/src/chatwidget/input_queue.rs b/codex-rs/tui/src/chatwidget/input_queue.rs
+index e4de46d51fa5192903ed..19b91b7ad9b0e15a2a36 100644
+--- a/codex-rs/tui/src/chatwidget/input_queue.rs
++++ b/codex-rs/tui/src/chatwidget/input_queue.rs
+@@ -19,6 +19,14 @@ pub(super) struct PendingInputPreview {
+     pub(super) rejected_steers: Vec<String>,
+ }
+ 
++/// Only regular user turns accept steers while their start notification is pending.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub(super) enum PendingStartKind {
++    #[default]
++    Command,
++    UserTurn,
++}
++
+ #[derive(Debug, Default)]
+ pub(super) struct InputQueueState {
+     /// User inputs queued while a turn is in progress.
+@@ -30,6 +38,7 @@ pub(super) struct InputQueueState {
+     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+     /// A user turn has been submitted to core, but `TurnStarted` has not arrived yet.
+     pub(super) user_turn_pending_start: bool,
++    pub(super) pending_start_kind: PendingStartKind,
+     /// User messages that tried to steer a non-regular turn and must be retried first.
+     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+     /// The origin of each rejected steer, kept in lockstep with its message.
+@@ -51,6 +60,10 @@ pub(super) struct InputQueueState {
+ }
+ 
+ impl InputQueueState {
++    pub(super) fn can_steer_pending_start(&self) -> bool {
++        self.user_turn_pending_start && self.pending_start_kind == PendingStartKind::UserTurn
++    }
++
+     pub(super) fn has_queued_follow_up_messages(&self) -> bool {
+         !self.rejected_steers_queue.is_empty() || !self.queued_user_messages.is_empty()
+     }
+@@ -60,6 +73,7 @@ impl InputQueueState {
+         self.queued_user_messages.clear();
+         self.queued_user_message_history_records.clear();
+         self.user_turn_pending_start = false;
++        self.pending_start_kind = PendingStartKind::Command;
+         self.rejected_steers_queue.clear();
+         self.rejected_steer_sources.clear();
+         self.rejected_steer_history_records.clear();
+diff --git a/codex-rs/tui/src/chatwidget/input_restore.rs b/codex-rs/tui/src/chatwidget/input_restore.rs
+index f078146d2adc3a31e059..43a1edfcd6e82fed5842 100644
+--- a/codex-rs/tui/src/chatwidget/input_restore.rs
++++ b/codex-rs/tui/src/chatwidget/input_restore.rs
+@@ -509,6 +509,7 @@ impl ChatWidget {
+                 .clone(),
+             recovered_queue: self.input_queue.recovered_queue,
+             user_turn_pending_start: self.input_queue.user_turn_pending_start,
++            pending_start_kind: self.input_queue.pending_start_kind,
+             submit_pending_steers_after_interrupt: self
+                 .input_queue
+                 .submit_pending_steers_after_interrupt,
+@@ -540,6 +541,11 @@ impl ChatWidget {
+             );
+             self.input_queue.user_turn_pending_start =
+                 preserve_in_flight_turn && input_state.user_turn_pending_start;
++            self.input_queue.pending_start_kind = if preserve_in_flight_turn {
++                input_state.pending_start_kind
++            } else {
++                PendingStartKind::Command
++            };
+             self.input_queue.submit_pending_steers_after_interrupt =
+                 preserve_in_flight_turn && input_state.submit_pending_steers_after_interrupt;
+             self.update_collaboration_mode_indicator();
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index fdfe3f6ab6c6a69fe688..4df30ba40a530a27e6da 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -195,7 +195,10 @@ impl ChatWidget {
+                 .retain(|binding| crate::task_mentions::valid_thread_path(&binding.path).is_none());
+         }
+ 
+-        let render_in_history = !self.turn_lifecycle.agent_turn_running;
++        // App-event submissions are serialized: a steer sent before TurnStarted follows the
++        // original turn/start request and uses its active turn instead of becoming a follow-up.
++        let render_in_history =
++            !self.turn_lifecycle.agent_turn_running && !self.input_queue.can_steer_pending_start();
+         let mut items: Vec<UserInput> = Vec::new();
+ 
+         // Special-case: "!cmd" executes a local shell command instead of sending to the model.
+@@ -438,6 +441,8 @@ impl ChatWidget {
+         self.note_realtime_typed_input(&submitted_message.text);
+         if render_in_history {
+             self.input_queue.user_turn_pending_start = true;
++            self.input_queue.pending_start_kind = PendingStartKind::UserTurn;
++            self.bottom_pane.set_turn_start_pending(/*pending*/ true);
+         }
+ 
+         // Persist the submitted text to cross-session message history. Mentions are encoded into
+diff --git a/codex-rs/tui/src/chatwidget/reconnect.rs b/codex-rs/tui/src/chatwidget/reconnect.rs
+index 0e940517949aefffcbe1..d4008788fe114afad4bb 100644
+--- a/codex-rs/tui/src/chatwidget/reconnect.rs
++++ b/codex-rs/tui/src/chatwidget/reconnect.rs
+@@ -28,6 +28,8 @@ impl ChatWidget {
+         self.bottom_pane
+             .set_interrupt_hint_visible(/*visible*/ false);
+         self.set_status_header("Reconnecting to app-server…".to_string());
++        // Keep in-flight input for recovery, but disconnected drafts have no pending send key.
++        self.bottom_pane.set_turn_start_pending(/*pending*/ false);
+         self.set_footer_hint_override(Some(vec![("ctrl+c".into(), "quit".into())]));
+         self.add_error_message("Connection lost. Attempting to reconnect…".into());
+     }
+diff --git a/codex-rs/tui/src/chatwidget/safety_buffering.rs b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+index b15856852081f9995c34..78adcc18b9a307f0c738 100644
+--- a/codex-rs/tui/src/chatwidget/safety_buffering.rs
++++ b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+@@ -90,6 +90,8 @@ impl ChatWidget {
+         self.finalize_turn();
+         self.safety_buffering_prompt = Some(prompt);
+         self.input_queue.user_turn_pending_start = true;
++        self.input_queue.pending_start_kind = PendingStartKind::UserTurn;
++        self.bottom_pane.set_turn_start_pending(/*pending*/ true);
+     }
+ 
+     pub(crate) fn commit_safety_buffered_retry_submission(&mut self, display: UserMessageDisplay) {
+@@ -98,6 +100,8 @@ impl ChatWidget {
+ 
+     pub(crate) fn cancel_safety_buffered_retry_submission(&mut self) {
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.pending_start_kind = PendingStartKind::Command;
++        self.bottom_pane.set_turn_start_pending(/*pending*/ false);
+         self.clear_safety_buffering();
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index a24e3695f0045bc14ff4..24ce371fcb950968c6fe 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -31,6 +31,8 @@ impl ChatWidget {
+             .set_voice_command_enabled(self.realtime_conversation_available_for_thread);
+         self.bottom_pane
+             .set_queue_submissions(/*queue_submissions*/ false);
++        self.bottom_pane
++            .set_turn_start_pending(self.input_queue.can_steer_pending_start());
+         if previous_thread_id != self.thread_id {
+             self.backend_banner_notice_model = None;
+             self.automatic_model_switch_state =
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index f67ece542ea7718000d2..f0dc60073bcc7101a3f6 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -283,6 +283,8 @@ impl ChatWidget {
+                     STATUS_DETAILS_DEFAULT_MAX_LINES,
+                 );
+                 self.input_queue.user_turn_pending_start = true;
++                self.input_queue.pending_start_kind = PendingStartKind::Command;
++                self.bottom_pane.set_turn_start_pending(/*pending*/ false);
+                 self.app_event_tx.compact();
+             }
+             SlashCommand::Recap => {
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__enter_before_turn_started_preserves_steers_and_tab_queue.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__enter_before_turn_started_preserves_steers_and_tab_queue.snap
+new file mode 100644
+index 00000000000000000000..2b737efdd7ed42ce70f3
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__enter_before_turn_started_preserves_steers_and_tab_queue.snap
+@@ -0,0 +1,17 @@
++---
++source: tui/src/chatwidget/tests/pending_start_tests.rs
++assertion_line: 37
++expression: "render_bottom_popup(&chat, 80)"
++---
++• Messages to be submitted after next tool call (press esc to interrupt and send
++  immediately)
++  ↳ first steer
++  ↳ second steer
++
++• Queued follow-up inputs
++  ↳ next turn
++    ⌥ + ↑ edit last queued message
++
++› unsent draft
++
++  tab to queue message                                       100% context left
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+index c7aaa1a7a5ce39573881..36194fdbd119d73d62bf 100644
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -258,6 +258,8 @@ mod luna_reserve_usage_tests;
+ mod mcp_startup;
+ #[path = "tests/misalignment_policy_tests.rs"]
+ mod misalignment_policy;
++#[path = "tests/pending_start_tests.rs"]
++mod pending_start_tests;
+ #[path = "tests/permission_shortcuts_tests.rs"]
+ mod permission_shortcuts_tests;
+ mod permissions;
+diff --git a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+index 7d184d880d5550d83fa8..641f2baccec0994ae2ff 100644
+--- a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
++++ b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+@@ -1775,6 +1775,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         queued_user_message_history_records: VecDeque::from([queued_history.clone()]),
+         recovered_queue: false,
+         user_turn_pending_start: true,
++        pending_start_kind: PendingStartKind::UserTurn,
+         submit_pending_steers_after_interrupt: true,
+         current_collaboration_mode: chat.current_collaboration_mode.clone(),
+         active_collaboration_mask: chat.active_collaboration_mask.clone(),
+diff --git a/codex-rs/tui/src/chatwidget/tests/pending_start_tests.rs b/codex-rs/tui/src/chatwidget/tests/pending_start_tests.rs
+new file mode 100644
+index 00000000000000000000..04ee1fc1da57c0554abb
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/pending_start_tests.rs
+@@ -0,0 +1,175 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn enter_before_turn_started_preserves_steers_and_tab_queue() {
++    let (mut chat, mut rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.bottom_pane
++        .set_composer_text("initial prompt".into(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    assert_matches!(next_submit_op(&mut ops), Op::UserTurn { .. });
++    assert!(!chat.bottom_pane.is_task_running());
++    let _ = drain_insert_history(&mut rx);
++
++    for (text, key) in [
++        ("first steer", KeyCode::Enter),
++        ("next turn", KeyCode::Tab),
++        ("second steer", KeyCode::Enter),
++    ] {
++        chat.bottom_pane
++            .set_composer_text(text.into(), Vec::new(), Vec::new());
++        chat.handle_key_event(KeyEvent::from(key));
++    }
++
++    for text in ["first steer", "second steer"] {
++        assert_matches!(next_submit_op(&mut ops), Op::UserTurn { items, .. } if items == vec![
++            UserInput::Text {
++                text: text.into(),
++                text_elements: Vec::new(),
++            }
++        ]);
++    }
++    assert_eq!(chat.queued_user_message_texts(), vec!["next turn"]);
++    assert!(drain_insert_history(&mut rx).is_empty());
++    chat.bottom_pane
++        .set_composer_text("unsent draft".into(), Vec::new(), Vec::new());
++    assert_chatwidget_snapshot!(
++        "enter_before_turn_started_preserves_steers_and_tab_queue",
++        render_bottom_popup(&chat, /*width*/ 80)
++    );
++    chat.bottom_pane
++        .set_composer_text(String::new(), Vec::new(), Vec::new());
++
++    handle_turn_started(&mut chat, "turn-1");
++    assert_no_submit_op(&mut ops);
++    assert_eq!(chat.queued_user_message_texts(), vec!["next turn"]);
++    complete_user_message(&mut chat, "steer-1", "first steer");
++    complete_user_message(&mut chat, "steer-2", "second steer");
++    assert!(chat.input_queue.pending_steers.is_empty());
++    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
++    assert_matches!(next_submit_op(&mut ops), Op::UserTurn { items, .. } if items == vec![
++        UserInput::Text {
++            text: "next turn".into(),
++            text_elements: Vec::new(),
++        }
++    ]);
++}
++
++#[tokio::test]
++async fn pending_special_commands_do_not_inherit_user_turn_steering() {
++    for command in [
++        Op::compact(),
++        Op::review(ReviewTarget::UncommittedChanges),
++        Op::run_user_shell_command("echo hello".into()),
++    ] {
++        let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++        chat.thread_id = Some(ThreadId::new());
++        chat.submit_user_message("initial prompt".into());
++        let _ = next_submit_op(&mut ops);
++        assert!(chat.submit_op(command.clone()));
++        assert_eq!(ops.try_recv().expect("pending command"), command);
++        chat.bottom_pane
++            .set_composer_text("follow-up".into(), Vec::new(), Vec::new());
++        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++        assert_eq!(chat.queued_user_message_texts(), vec!["follow-up"]);
++        assert!(chat.input_queue.pending_steers.is_empty());
++        assert_no_submit_op(&mut ops);
++    }
++}
++
++#[tokio::test]
++async fn pending_user_turn_does_not_start_shell_input_early() {
++    let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.submit_user_message("initial prompt".into());
++    let _ = next_submit_op(&mut ops);
++    chat.bottom_pane
++        .set_composer_text("!echo hello".into(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++    assert_eq!(chat.queued_user_message_texts(), vec!["!echo hello"]);
++    assert!(chat.input_queue.pending_steers.is_empty());
++    assert_no_submit_op(&mut ops);
++}
++
++#[tokio::test]
++async fn pending_user_turn_keeps_settings_and_recovery_submission_guards() {
++    for recovering in [false, true] {
++        let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++        chat.thread_id = Some(ThreadId::new());
++        chat.submit_user_message("initial prompt".into());
++        let _ = next_submit_op(&mut ops);
++        chat.input_queue.rate_limit_recovery_pending = recovering;
++        chat.input_queue.suppress_queue_autosend = !recovering;
++        chat.bottom_pane
++            .set_composer_text("follow-up".into(), Vec::new(), Vec::new());
++        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++        assert_eq!(chat.queued_user_message_texts(), vec!["follow-up"]);
++        assert!(chat.input_queue.pending_steers.is_empty());
++        assert_no_submit_op(&mut ops);
++    }
++}
++
++#[tokio::test]
++async fn pending_user_turn_steering_survives_in_flight_thread_restore() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    chat.submit_user_message("initial prompt".into());
++    let input = chat.capture_thread_input_state();
++
++    let (mut restored, mut rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    restored.thread_id = Some(thread_id);
++    restored.restore_thread_input_state(
++        input,
++        ThreadInputStateRestoreMode {
++            preserve_in_flight_turn: true,
++        },
++    );
++    let _ = drain_insert_history(&mut rx);
++    restored.bottom_pane.set_composer_text(
++        "steer after switching back".into(),
++        Vec::new(),
++        Vec::new(),
++    );
++    restored.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++    assert_matches!(next_submit_op(&mut ops), Op::UserTurn { items, .. } if items == vec![
++        UserInput::Text {
++            text: "steer after switching back".into(),
++            text_elements: Vec::new(),
++        }
++    ]);
++    assert!(restored.input_queue.queued_user_messages.is_empty());
++    assert_eq!(restored.input_queue.pending_steers.len(), 1);
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
++#[tokio::test]
++async fn pending_safety_retry_accepts_enter_as_steer() {
++    let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.prepare_safety_buffered_retry_submission("retry prompt".into());
++    chat.bottom_pane
++        .set_composer_text("steer retry".into(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++    assert_matches!(next_submit_op(&mut ops), Op::UserTurn { .. });
++    assert_eq!(chat.input_queue.pending_steers.len(), 1);
++    assert!(chat.input_queue.queued_user_messages.is_empty());
++}
++
++#[tokio::test]
++async fn startup_enter_still_waits_for_session_configuration() {
++    let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.bottom_pane
++        .set_composer_text("startup prompt".into(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++    assert_eq!(chat.queued_user_message_texts(), vec!["startup prompt"]);
++    assert!(chat.input_queue.pending_steers.is_empty());
++    assert_no_submit_op(&mut ops);
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests/review_mode.rs b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+index f947b364d2de3bfe931b..b2d57486ab9e7ad42160 100644
+--- a/codex-rs/tui/src/chatwidget/tests/review_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+@@ -388,6 +388,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
+             queued_user_message_history_records: VecDeque::new(),
+             recovered_queue: false,
+             user_turn_pending_start: false,
++            pending_start_kind: PendingStartKind::Command,
+             submit_pending_steers_after_interrupt: false,
+             current_collaboration_mode: chat.current_collaboration_mode.clone(),
+             active_collaboration_mask: chat.active_collaboration_mask.clone(),
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 388af9dffc8951797b7d..b8ec902f0a5312352ddd 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -29,8 +29,11 @@ impl ChatWidget {
+     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
+     ///
+     /// The bottom pane only has one running flag, but this module treats it as a derived state of
+-    /// both the agent turn lifecycle and MCP startup lifecycle.
++    /// the agent turn lifecycle, reviews, and MCP startup. Pending regular starts only affect
++    /// composer queuing, so they do not change runtime status or other task-running behavior.
+     pub(super) fn update_task_running_state(&mut self) {
++        self.bottom_pane
++            .set_turn_start_pending(self.input_queue.can_steer_pending_start());
+         self.bottom_pane.set_task_running(
+             self.turn_lifecycle.agent_turn_running
+                 || self.review.is_review_mode
+@@ -76,6 +79,7 @@ impl ChatWidget {
+     pub(super) fn on_task_started(&mut self) {
+         self.clear_context_compaction();
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.pending_start_kind = PendingStartKind::Command;
+         self.reset_safety_buffering_for_turn_start();
+         self.turn_lifecycle.start(Instant::now());
+         self.transcript.reset_turn_flags();
+@@ -183,6 +187,7 @@ impl ChatWidget {
+         self.status_state.reasoning_resume_turn_id = None;
+         self.reasoning_header = None;
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.pending_start_kind = PendingStartKind::Command;
+         self.clear_active_hook_cell();
+         self.clear_guardian_review_status();
+         self.turn_lifecycle.finish();
+@@ -341,6 +346,7 @@ impl ChatWidget {
+         self.clear_active_hook_cell();
+         // Reset running state and clear streaming buffers.
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.pending_start_kind = PendingStartKind::Command;
+         self.clear_guardian_review_status();
+         self.turn_lifecycle.finish();
+         self.update_task_running_state();
+@@ -392,7 +398,26 @@ impl ChatWidget {
+ 
+     pub(crate) fn handle_turn_start_rejection(&mut self, message: String) -> bool {
+         if !self.input_queue.user_turn_pending_start {
+-            return false;
++            // An early steer can already be in the app queue when the original start fails.
++            // Retain its input when that later command also fails, rather than exiting the TUI.
++            if !self.input_queue.suppress_queue_autosend || !self.enqueue_rejected_steer() {
++                return false;
++            }
++        } else if self.input_queue.can_steer_pending_start()
++            && !self.input_queue.pending_steers.is_empty()
++        {
++            // Preserve the original request before finalize_turn clears its retry prompt. Hold
++            // all failed input until the user fixes settings or edits the queue.
++            self.input_queue.suppress_queue_autosend = true;
++            if let Some(prompt) = self.safety_buffering_prompt.take() {
++                self.input_queue.rejected_steers_queue.push_back(prompt);
++                self.input_queue
++                    .rejected_steer_sources
++                    .push_back(self.safety_buffering_source);
++                self.input_queue
++                    .rejected_steer_history_records
++                    .push_back(UserMessageHistoryRecord::UserMessageText);
++            }
+         }
+         self.on_error(message);
+         true
+diff --git a/codex-rs/tui/src/chatwidget/user_messages.rs b/codex-rs/tui/src/chatwidget/user_messages.rs
+index 59dec1f6d252a1379409..31d7c6a59da3adcfc613 100644
+--- a/codex-rs/tui/src/chatwidget/user_messages.rs
++++ b/codex-rs/tui/src/chatwidget/user_messages.rs
+@@ -25,6 +25,7 @@ use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+ use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
+ 
+ use super::ChatWidget;
++use super::PendingStartKind;
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub(crate) struct UserMessage {
+@@ -142,6 +143,7 @@ pub(crate) struct ThreadInputState {
+     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+     pub(crate) recovered_queue: bool,
+     pub(super) user_turn_pending_start: bool,
++    pub(super) pending_start_kind: PendingStartKind,
+     pub(super) submit_pending_steers_after_interrupt: bool,
+     pub(super) current_collaboration_mode: CollaborationMode,
+     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
