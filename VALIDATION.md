@@ -2,9 +2,9 @@
 
 Base: `818f1cca8ccf8899f0f4d59336baebaccf358eed`.
 
-Final patched source tree: `3ab9f1d4318942b569ffec405642841fc91e720b`.
+Steering + Heads Up patched source tree: `3ab9f1d4318942b569ffec405642841fc91e720b`.
 
-- Both patches apply sequentially to a fresh index at the base; the resulting tree exactly matches the isolated extraction.
+- The steering and Heads Up patches apply sequentially to a fresh index at the base; the resulting tree exactly matches the isolated extraction.
 - The optional Stop-hook patch applies independently to the same base; its seven Python tests pass.
 - Rust formatting and source whitespace checks pass. Scoped `just fix` passed for TUI, core, app-server, app-server-protocol, and config; its only edit was an unrelated upstream unused import, excluded from the patches.
 - The expanded-view config schema was regenerated and its property compared against the extracted schema. Experimental app-server exports were regenerated successfully for the capture-control RPC.
@@ -27,3 +27,22 @@ just test -p codex-app-server-protocol
 ```
 
 Tests use the fork's Studio build runner with Rust 1.95.0 on macOS. The build runner is validation infrastructure and is not included in the patches. Full workspace tests, Windows/Linux builds, and interactive UI acceptance were not performed. Rendered UI behavior has snapshot coverage.
+
+## Background command wakeups
+
+- Patch `0003` applies independently to `BASE`; its resulting tree exactly matches the isolated extraction: `0fca39fa77d38479913812dfd30a4abd89d244a4`.
+- All three patches also apply sequentially: resulting tree `3213b91dbf05468250e96d05570deabdb037d0a5`.
+- The patch contains nine core implementation/test files, with no Heads Up dependency or new configuration/dependencies.
+- Rust formatting and whitespace checks pass. An independent review found no blocking concurrency or cancellation issues.
+- Focused standalone tests: 26 sleep-related tests and 3 completion-readiness tests passed (29 total).
+- Scoped core lint passed. Its sole automatic edit removed an unrelated upstream unused import; that edit is excluded from this patch.
+- The implementation matches the already installed fork build `88549bed1cd6`; extraction does not change the running fork.
+
+```sh
+just test -p codex-core -E 'test(sleep) | test(unified_exec::process_manager_tests)' --test-threads 4
+# The first filter did not match the process-manager module name; run its new cases explicitly.
+just test -p codex-core -E 'test(background_completion_wakes_waiter_once)' --test-threads 4
+just fix -p codex-core
+```
+
+The completion tests cover pending and active sleeps, one-time delivery, initial exec eligibility, and collected/foreground exclusions. Command-execution coverage is Unix-only; Windows behavior and the full workspace suite were not validated for this patch.

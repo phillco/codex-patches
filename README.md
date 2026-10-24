@@ -6,6 +6,7 @@ Focused functionality patches for [Codex CLI](https://github.com/openai/codex), 
 | --- | --- | --- |
 | [Pending-turn steering](patches/0001-pending-turn-steering.patch) | Enter steers a submitted turn even before `TurnStarted` arrives; Tab queues. Preserves input when starting or steering fails. | Base |
 | [Heads Up](patches/0002-heads-up.patch) | Optional independent conversation reviewer, persistent notes, full explanations, known topics, editable discussion drafts, and direct send. Includes `tui.heads_up_expanded`. | Steering patch |
+| [Background command wakeups](patches/0003-background-command-wakeups.patch) | Ends `clock.sleep` early when a background command finishes, returning its session ID and status. | Base; independent of the other patches |
 
 The native Heads Up patch includes core and app-server integration, TUI rendering, generated API/schema artifacts, tests, and snapshots. It retains the parent's prompt prefix and disables tool execution for the review. Reviews run separately from the main turn, with bounded retries and output; results enter the conversation only through an explicit user action.
 
@@ -29,9 +30,11 @@ git apply --check ../codex-patches/patches/0001-pending-turn-steering.patch
 git apply ../codex-patches/patches/0001-pending-turn-steering.patch
 git apply --check ../codex-patches/patches/0002-heads-up.patch
 git apply ../codex-patches/patches/0002-heads-up.patch
+git apply --check ../codex-patches/patches/0003-background-command-wakeups.patch
+git apply ../codex-patches/patches/0003-background-command-wakeups.patch
 ```
 
-[`series`](series) records this order. Steering can be used independently. Heads Up depends on steering so “Send to agent” also steers during the pending-start interval.
+[`series`](series) records this order. Steering and background command wakeups can each be used independently. Heads Up depends on steering so “Send to agent” also steers during the pending-start interval.
 
 Build Codex using its normal build instructions after applying the patches.
 
@@ -53,9 +56,15 @@ Turning reviews off stops prompt capture, releases the retained review snapshot,
 
 Notes survive new prompts. “Discuss with agent” appends quoted, editable text to the composer; “Send to agent” sends the full note while preserving the draft. “Knew this” remembers the topic across sessions; dismissal hides the current note. Known/seen topics are stored under Codex home.
 
+## Background command wakeups
+
+With this patch, completion wakeups are **automatic whenever the agent calls `clock.sleep`**. There is no opt-in parameter or configuration switch. The agent chooses whether to sleep; background commands do not start a new turn or resume an idle agent on their own.
+
+A pending or newly completed background `exec_command` can end the sleep early. The result includes the command’s session ID and exit code, or a failure/timeout status. The agent retrieves output with `write_stdin`. Each completion wakes at most one sleep; collecting the final result or removing the process discards its pending notification. Commands that finish inline do not leave a wakeup behind. Normal timer expiry and interruption by new user input remain supported.
+
 ## Optional legacy Stop-hook prototype
 
-[`optional/heads-up-stop-hook.patch`](optional/heads-up-stop-hook.patch) preserves the earlier Stop-hook prototype and its local marketplace registration. **It is an alternative to native Heads Up, not an additional dependency; skip it when applying the two-patch native series.** It applies independently to the base and is not part of `series`. It reviews only the final response in an isolated `codex exec` process, without the native explanation/actions UI. Use it as an alternative; enabling the native reviewer with `/heads-up` disables the matching local plugin to avoid duplicate reviews. If enabling through config instead, disable the plugin separately.
+[`optional/heads-up-stop-hook.patch`](optional/heads-up-stop-hook.patch) preserves the earlier Stop-hook prototype and its local marketplace registration. **It is an alternative to native Heads Up, not an additional dependency; skip it when applying the native Heads Up pair.** It applies independently to the base and is not part of `series`. It reviews only the final response in an isolated `codex exec` process, without the native explanation/actions UI. Use it as an alternative; enabling the native reviewer with `/heads-up` disables the matching local plugin to avoid duplicate reviews. If enabling through config instead, disable the plugin separately.
 
 ## Validation
 
