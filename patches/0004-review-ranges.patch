@@ -1,0 +1,838 @@
+diff --git a/codex-rs/exec/src/cli.rs b/codex-rs/exec/src/cli.rs
+index 0ef0be6af9cc177e86da68e9fa20df05f9ac813c..a14143a970dbb13652f0b3e348ad8884722bc39e 100644
+--- a/codex-rs/exec/src/cli.rs
++++ b/codex-rs/exec/src/cli.rs
+@@ -275,16 +275,18 @@ pub struct ReviewArgs {
+     /// Review staged, unstaged, and untracked changes.
+     #[arg(
+         long = "uncommitted",
++        short = 'u',
+         default_value_t = false,
+-        conflicts_with_all = ["base", "commit", "prompt"]
++        conflicts_with_all = ["base", "commit", "range", "rev", "prompt"]
+     )]
+     pub uncommitted: bool,
+ 
+     /// Review changes against the given base branch.
+     #[arg(
+         long = "base",
++        short = 'b',
+         value_name = "BRANCH",
+-        conflicts_with_all = ["uncommitted", "commit", "prompt"]
++        conflicts_with_all = ["uncommitted", "commit", "range", "rev", "prompt"]
+     )]
+     pub base: Option<String>,
+ 
+@@ -292,12 +294,36 @@ pub struct ReviewArgs {
+     #[arg(
+         long = "commit",
+         value_name = "SHA",
+-        conflicts_with_all = ["uncommitted", "base", "prompt"]
++        conflicts_with_all = ["uncommitted", "base", "range", "rev", "prompt"]
+     )]
+     pub commit: Option<String>,
+ 
++    /// Review the commits in BASE..HEAD (BASE exclusive). PROMPT, if given, adds focus instructions.
++    #[arg(
++        long = "range",
++        short = 'R',
++        value_name = "BASE..HEAD",
++        conflicts_with_all = ["uncommitted", "base", "commit", "rev"]
++    )]
++    pub range: Option<String>,
++
++    /// Review a jj revset: one contiguous, linear run of commits (e.g. 'main..@-').
++    /// PROMPT, if given, adds focus instructions.
++    #[arg(
++        long = "rev",
++        short = 'r',
++        value_name = "REVSET",
++        conflicts_with_all = ["uncommitted", "base", "commit", "range"]
++    )]
++    pub rev: Option<String>,
++
+     /// Optional commit title to display in the review summary.
+-    #[arg(long = "title", value_name = "TITLE", requires = "commit")]
++    #[arg(
++        long = "title",
++        value_name = "TITLE",
++        requires = "commit",
++        conflicts_with_all = ["range", "rev"]
++    )]
+     pub commit_title: Option<String>,
+ 
+     /// Custom review instructions. If `-` is used, read from stdin.
+diff --git a/codex-rs/exec/src/cli_tests.rs b/codex-rs/exec/src/cli_tests.rs
+index 423935904acf25d95a348ef26334d161089b492f..8b3e3f4634231e44f5dcdade3905530dd30b0d79 100644
+--- a/codex-rs/exec/src/cli_tests.rs
++++ b/codex-rs/exec/src/cli_tests.rs
+@@ -145,3 +145,86 @@ fn worktree_flag_is_accepted_before_fork_subcommand() {
+     assert!(cli.worktree);
+     assert!(matches!(cli.command, Some(Command::Fork(_))));
+ }
++
++#[test]
++fn review_range_selectors_accept_focus_and_short_aliases() {
++    for (flag, value, is_git) in [
++        ("--range", "main..HEAD", true),
++        ("-R", "main..HEAD", true),
++        ("--rev", "main..@-", false),
++        ("-r", "main..@-", false),
++    ] {
++        let cli = Cli::try_parse_from(["codex-exec", "review", flag, value, "Check races"])
++            .expect("range accepts focus");
++        let Some(Command::Review(args)) = cli.command else {
++            panic!("expected review");
++        };
++        assert_eq!(
++            (
++                args.range.as_deref(),
++                args.rev.as_deref(),
++                args.prompt.as_deref()
++            ),
++            (
++                is_git.then_some(value),
++                (!is_git).then_some(value),
++                Some("Check races")
++            )
++        );
++    }
++}
++
++#[test]
++fn review_range_selectors_reject_conflicting_targets() {
++    for options in [
++        vec!["--range", "main..HEAD", "--rev", "@-"],
++        vec!["--range", "main..HEAD", "--uncommitted"],
++        vec!["--rev", "@-", "--base", "main"],
++        vec!["--range", "main..HEAD", "--commit", "HEAD"],
++        vec!["--rev", "@-", "--title", "change"],
++        vec!["--range", "main..HEAD", "--title", "change"],
++    ] {
++        let error = Cli::try_parse_from(["codex-exec", "review"].into_iter().chain(options))
++            .expect_err("targets conflict");
++        assert!(matches!(
++            error.kind(),
++            clap::error::ErrorKind::ArgumentConflict
++                | clap::error::ErrorKind::MissingRequiredArgument
++        ));
++    }
++}
++
++#[test]
++fn review_short_existing_targets_and_stdin_focus_parse() {
++    let cli = Cli::try_parse_from(["codex-exec", "review", "-u"]).expect("short uncommitted");
++    assert!(matches!(cli.command, Some(Command::Review(args)) if args.uncommitted));
++    let cli = Cli::try_parse_from(["codex-exec", "review", "-b", "main"]).expect("short base");
++    assert!(
++        matches!(cli.command, Some(Command::Review(args)) if args.base.as_deref() == Some("main"))
++    );
++    let cli = Cli::try_parse_from(["codex-exec", "review", "-R", "main..HEAD", "-"])
++        .expect("stdin focus marker");
++    assert!(
++        matches!(cli.command, Some(Command::Review(args)) if args.prompt.as_deref() == Some("-"))
++    );
++}
++
++#[test]
++fn review_commit_retains_optional_title() {
++    let cli = Cli::try_parse_from([
++        "codex-exec",
++        "review",
++        "--commit",
++        "HEAD",
++        "--title",
++        "change",
++    ])
++    .expect("commit accepts title");
++    let Some(Command::Review(args)) = cli.command else {
++        panic!("expected review");
++    };
++    assert_eq!(
++        (args.commit.as_deref(), args.commit_title.as_deref()),
++        (Some("HEAD"), Some("change"))
++    );
++}
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index c7c54fe8339c67c4287e10c2deb1bda45d6d5434..90889bc9ec3d90ffe79d99df558c73aa4cc1bfb3 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -10,6 +10,7 @@ mod event_processor;
+ mod event_processor_with_human_output;
+ pub(crate) mod event_processor_with_jsonl_output;
+ pub(crate) mod exec_events;
++mod review_range;
+ mod worktree;
+ 
+ pub use cli::Cli;
+@@ -325,6 +326,20 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+         .with_writer(std::io::stderr)
+         .with_filter(exec_stderr_env_filter());
+ 
++    // Reviews run git; in jj-colocated repos the agent git shim blocks it unless JJ_GIT_OK=1.
++    if let Some(ExecCommand::Review(_)) = command.as_ref() {
++        let review_dir = match cwd.as_deref() {
++            Some(dir) => std::env::current_dir()?.join(dir),
++            None => std::env::current_dir()?,
++        };
++        if review_range::is_jj_repo(&review_dir) {
++            config_overrides.raw_overrides.push(format!(
++                "shell_environment_policy.set.{}=\"1\"",
++                review_range::JJ_GIT_OK_ENV
++            ));
++        }
++    }
++
+     let sandbox_mode = if dangerously_bypass_approvals_and_sandbox {
+         Some(SandboxMode::DangerFullAccess)
+     } else {
+@@ -870,7 +885,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+ 
+     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
+         (Some(ExecCommand::Review(review_cli)), _, _) => {
+-            let review_request = build_review_request(review_cli)?;
++            let review_request = build_review_request(review_cli, &default_cwd)?;
+             let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
+             (InitialOperation::Review { review_request }, summary)
+         }
+@@ -2301,7 +2316,27 @@ fn resolve_root_prompt(prompt_arg: Option<String>) -> String {
+     }
+ }
+ 
+-fn build_review_request(args: &ReviewArgs) -> anyhow::Result<ReviewRequest> {
++fn build_review_request(args: &ReviewArgs, cwd: &Path) -> anyhow::Result<ReviewRequest> {
++    let range = if let Some(spec) = args.range.as_deref() {
++        let (base, head) = review_range::parse_range_spec(spec)?;
++        Some(review_range::resolve_git_range(cwd, &base, &head)?)
++    } else if let Some(revset) = args.rev.as_deref() {
++        Some(review_range::resolve_jj_revset(cwd, revset)?)
++    } else {
++        None
++    };
++    if let Some(range) = range {
++        let focus = args
++            .prompt
++            .clone()
++            .map(|prompt| resolve_prompt(Some(prompt)));
++        return Ok(ReviewRequest {
++            target: ReviewTarget::Custom {
++                instructions: review_range::range_review_instructions(&range, focus.as_deref()),
++            },
++            user_facing_hint: Some(review_range::range_hint(&range)),
++        });
++    }
+     let target = if args.uncommitted {
+         ReviewTarget::UncommittedChanges
+     } else if let Some(branch) = args.base.clone() {
+@@ -2321,7 +2356,7 @@ fn build_review_request(args: &ReviewArgs) -> anyhow::Result<ReviewRequest> {
+         }
+     } else {
+         anyhow::bail!(
+-            "Specify --uncommitted, --base, --commit, or provide custom review instructions"
++            "Specify --uncommitted, --base, --commit, --range, --rev, or provide custom review instructions"
+         );
+     };
+ 
+diff --git a/codex-rs/exec/src/lib_tests.rs b/codex-rs/exec/src/lib_tests.rs
+index fb5b5891a32403ff54c85b9c65ec0c7e2d7602ef..1e96da80c3d8a3eb709932bccd2292ffffe1edda 100644
+--- a/codex-rs/exec/src/lib_tests.rs
++++ b/codex-rs/exec/src/lib_tests.rs
+@@ -105,9 +105,12 @@ fn builds_uncommitted_review_request() {
+         base: None,
+         commit: None,
+         commit_title: None,
++        range: None,
++        rev: None,
+         prompt: None,
+     };
+-    let request = build_review_request(&args).expect("builds uncommitted review request");
++    let request =
++        build_review_request(&args, Path::new(".")).expect("builds uncommitted review request");
+ 
+     let expected = ReviewRequest {
+         target: ReviewTarget::UncommittedChanges,
+@@ -124,9 +127,12 @@ fn builds_commit_review_request_with_title() {
+         base: None,
+         commit: Some("123456789".to_string()),
+         commit_title: Some("Add review command".to_string()),
++        range: None,
++        rev: None,
+         prompt: None,
+     };
+-    let request = build_review_request(&args).expect("builds commit review request");
++    let request =
++        build_review_request(&args, Path::new(".")).expect("builds commit review request");
+ 
+     let expected = ReviewRequest {
+         target: ReviewTarget::Commit {
+@@ -146,9 +152,12 @@ fn builds_custom_review_request_trims_prompt() {
+         base: None,
+         commit: None,
+         commit_title: None,
++        range: None,
++        rev: None,
+         prompt: Some("  custom review instructions  ".to_string()),
+     };
+-    let request = build_review_request(&args).expect("builds custom review request");
++    let request =
++        build_review_request(&args, Path::new(".")).expect("builds custom review request");
+ 
+     let expected = ReviewRequest {
+         target: ReviewTarget::Custom {
+diff --git a/codex-rs/exec/src/review_range.rs b/codex-rs/exec/src/review_range.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..df5a3c8633ae50b65f9f7dd60b37fd562d6d4f61
+--- /dev/null
++++ b/codex-rs/exec/src/review_range.rs
+@@ -0,0 +1,197 @@
++//! Commit-range targets for `codex review`: `--range A..B` (git) and `--rev REVSET` (jj).
++//!
++//! Both resolve to a concrete `base..head` pair of git commits and become a custom review
++//! target whose instructions point the reviewer at exactly those commits.
++
++use std::collections::HashSet;
++use std::path::Path;
++use std::process::Command;
++
++use anyhow::Context;
++
++/// Lets git run inside jj-colocated repos, whose agent git shim otherwise blocks it.
++pub(crate) const JJ_GIT_OK_ENV: &str = "JJ_GIT_OK";
++
++/// A resolved range of commits: `base` (exclusive) to `head` (inclusive).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct CommitRange {
++    pub base: String,
++    pub head: String,
++    /// Full commit IDs, oldest first.
++    pub commits: Vec<String>,
++}
++
++/// Splits `A..B` into its endpoints. Symmetric differences (`A...B`) and open ends are rejected.
++pub(crate) fn parse_range_spec(spec: &str) -> anyhow::Result<(String, String)> {
++    if spec.contains("...") {
++        anyhow::bail!("--range takes A..B (two dots); A...B is not supported");
++    }
++    let Some((base, head)) = spec.split_once("..") else {
++        anyhow::bail!("--range must look like BASE..HEAD, got '{spec}'");
++    };
++    let (base, head) = (base.trim(), head.trim());
++    if base.is_empty() || head.is_empty() {
++        anyhow::bail!("--range needs both ends (BASE..HEAD), got '{spec}'");
++    }
++    Ok((base.to_string(), head.to_string()))
++}
++
++/// Resolves and validates `base..head` with git in `cwd`.
++pub(crate) fn resolve_git_range(cwd: &Path, base: &str, head: &str) -> anyhow::Result<CommitRange> {
++    let base_sha = rev_parse_commit(cwd, base)?;
++    let head_sha = rev_parse_commit(cwd, head)?;
++    run(
++        cwd,
++        "git",
++        &["merge-base", "--is-ancestor", &base_sha, &head_sha],
++    )
++    .context("range base must be an ancestor of its head")?;
++    let log = run(
++        cwd,
++        "git",
++        &[
++            "log",
++            "--reverse",
++            "--format=%H",
++            &format!("{base_sha}..{head_sha}"),
++        ],
++    )?;
++    let commits = log.lines().map(str::to_string).collect::<Vec<_>>();
++    if commits.is_empty() {
++        anyhow::bail!("{base}..{head} contains no commits");
++    }
++    Ok(CommitRange {
++        base: base_sha,
++        head: head_sha,
++        commits,
++    })
++}
++
++/// Resolves a jj revset to a single linear, contiguous run of commits, as git `base..head`.
++pub(crate) fn resolve_jj_revset(cwd: &Path, revset: &str) -> anyhow::Result<CommitRange> {
++    // Resolve once using normal jj snapshot semantics, so `@` includes current
++    // working-copy changes. Later checks use these immutable commit IDs.
++    let log = run(
++        cwd,
++        "jj",
++        &[
++            "--no-pager",
++            "log",
++            "--no-graph",
++            "-r",
++            revset,
++            "-T",
++            "commit_id ++ \" \" ++ parents.map(|p| p.commit_id()).join(\" \") ++ \"\\n\"",
++        ],
++    )?;
++    let rows = log
++        .lines()
++        .map(|line| line.split_whitespace().collect::<Vec<_>>())
++        .collect::<Vec<_>>();
++    if rows.is_empty() {
++        anyhow::bail!("jj revset selects no commits");
++    }
++    if rows.iter().any(|row| row.len() != 2) {
++        anyhow::bail!("jj revset must be linear: every selected commit needs exactly one parent");
++    }
++    let selected = rows.iter().map(|row| row[0]).collect::<HashSet<_>>();
++    let parents = rows.iter().map(|row| row[1]).collect::<HashSet<_>>();
++    let roots = rows
++        .iter()
++        .filter(|row| !selected.contains(row[1]))
++        .collect::<Vec<_>>();
++    let heads = selected.difference(&parents).copied().collect::<Vec<_>>();
++    let ([root], [head]) = (roots.as_slice(), heads.as_slice()) else {
++        anyhow::bail!("jj revset must select one contiguous, linear run of commits");
++    };
++    let range = resolve_git_range(cwd, root[1], head)
++        .context("resolving the jj revset with git (is this jj repo colocated with git?)")?;
++    let git_selected = range
++        .commits
++        .iter()
++        .map(String::as_str)
++        .collect::<HashSet<_>>();
++    if selected != git_selected {
++        anyhow::bail!("jj revset does not match its resolved Git commit range");
++    }
++    Ok(range)
++}
++
++/// Review instructions for a range, in the style of the built-in commit prompt.
++pub(crate) fn range_review_instructions(range: &CommitRange, focus: Option<&str>) -> String {
++    let CommitRange {
++        base,
++        head,
++        commits,
++    } = range;
++    let count = commits.len();
++    let noun = if count == 1 { "commit" } else { "commits" };
++    let mut instructions = format!(
++        "Review commit range {base}..{head} ({count} {noun}).\n\nRun `git diff {base} {head}` for combined changes and `git log -p {base}..{head}` for individual commits. Review only this range. Provide prioritized, actionable findings."
++    );
++    if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
++        instructions.push_str(&format!("\n\nAdditional focus: {focus}"));
++    }
++    instructions
++}
++
++/// A short label for the review summary, e.g. `3 commits 1a2b3c4..5d6e7f8`.
++pub(crate) fn range_hint(range: &CommitRange) -> String {
++    let count = range.commits.len();
++    let noun = if count == 1 { "commit" } else { "commits" };
++    format!(
++        "{count} {noun} {}..{}",
++        short(&range.base),
++        short(&range.head)
++    )
++}
++
++/// Whether `dir` is inside a jj repository.
++pub(crate) fn is_jj_repo(dir: &Path) -> bool {
++    dir.ancestors()
++        .any(|ancestor| ancestor.join(".jj").is_dir())
++}
++
++fn short(sha: &str) -> &str {
++    sha.get(..10).unwrap_or(sha)
++}
++
++fn rev_parse_commit(cwd: &Path, rev: &str) -> anyhow::Result<String> {
++    let out = run(
++        cwd,
++        "git",
++        &[
++            "rev-parse",
++            "--verify",
++            "--quiet",
++            "--end-of-options",
++            &format!("{rev}^{{commit}}"),
++        ],
++    )
++    .with_context(|| format!("unknown commit '{rev}'"))?;
++    Ok(out.trim().to_string())
++}
++
++fn run(cwd: &Path, program: &str, args: &[&str]) -> anyhow::Result<String> {
++    let mut command = Command::new(program);
++    if program == "git" {
++        command.args(["--no-pager", "-c", "color.ui=false"]);
++    } else if program == "jj" {
++        command.args(["--color", "never"]);
++    }
++    let output = command
++        .args(args)
++        .current_dir(cwd)
++        .env(JJ_GIT_OK_ENV, "1")
++        .output()
++        .with_context(|| format!("failed to run {program} (is it installed?)"))?;
++    if !output.status.success() {
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        anyhow::bail!("{program} {} failed: {}", args.join(" "), stderr.trim());
++    }
++    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
++}
++
++#[cfg(test)]
++#[path = "review_range_tests.rs"]
++mod tests;
+diff --git a/codex-rs/exec/src/review_range_tests.rs b/codex-rs/exec/src/review_range_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..29a36cb5c36f5bed9c3c0525897a449c3fffcc12
+--- /dev/null
++++ b/codex-rs/exec/src/review_range_tests.rs
+@@ -0,0 +1,237 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn parses_two_dot_ranges() {
++    assert_eq!(
++        parse_range_spec("main..feature").expect("valid range"),
++        ("main".to_string(), "feature".to_string())
++    );
++    assert_eq!(
++        parse_range_spec(" abc123 .. def456 ").expect("valid range with spaces"),
++        ("abc123".to_string(), "def456".to_string())
++    );
++}
++
++#[test]
++fn rejects_malformed_ranges() {
++    for spec in ["main", "main...feature", "..feature", "main..", ""] {
++        assert!(
++            parse_range_spec(spec).is_err(),
++            "expected '{spec}' to be rejected"
++        );
++    }
++}
++
++#[test]
++fn renders_range_instructions_with_focus() {
++    let range = CommitRange {
++        base: "aaaa".to_string(),
++        head: "bbbb".to_string(),
++        commits: vec!["1111111".to_string(), "2222222".to_string()],
++    };
++    let expected = "Review commit range aaaa..bbbb (2 commits).\n\nRun `git diff aaaa bbbb` for combined changes and `git log -p aaaa..bbbb` for individual commits. Review only this range. Provide prioritized, actionable findings.\n\nAdditional focus: concurrency";
++    assert_eq!(
++        range_review_instructions(&range, Some("  concurrency ")),
++        expected
++    );
++    assert_eq!(range_hint(&range), "2 commits aaaa..bbbb");
++}
++
++fn git(dir: &Path, args: &[&str]) -> String {
++    run(dir, "git", args).expect("git command succeeds")
++}
++
++fn commit(dir: &Path, message: &str) -> String {
++    std::fs::write(dir.join("file.txt"), message).expect("write file");
++    git(dir, &["add", "file.txt"]);
++    git(
++        dir,
++        &[
++            "-c",
++            "user.name=t",
++            "-c",
++            "user.email=t@t",
++            "-c",
++            "commit.gpgSign=false",
++            "commit",
++            "-qm",
++            message,
++        ],
++    );
++    git(dir, &["rev-parse", "HEAD"]).trim().to_string()
++}
++
++#[test]
++fn resolves_git_ranges_oldest_first() {
++    let repo = tempfile::tempdir().expect("tempdir");
++    git(repo.path(), &["init", "-q"]);
++    let base = commit(repo.path(), "base");
++    let first = commit(repo.path(), "one");
++    let head = commit(repo.path(), "two");
++
++    let range = resolve_git_range(repo.path(), &base, "HEAD").expect("resolves range");
++    assert_eq!(
++        range,
++        CommitRange {
++            base,
++            head: head.clone(),
++            commits: vec![first, head]
++        }
++    );
++
++    assert!(
++        resolve_git_range(repo.path(), "HEAD", "HEAD").is_err(),
++        "empty range"
++    );
++    assert!(
++        resolve_git_range(repo.path(), "no-such-ref", "HEAD").is_err(),
++        "unknown base"
++    );
++}
++
++#[test]
++fn range_instructions_keep_generated_text_small_and_preserve_long_focus() {
++    let range = CommitRange {
++        base: "a".repeat(64),
++        head: "b".repeat(64),
++        commits: vec!["c".repeat(64); 10_000],
++    };
++    let generated = range_review_instructions(&range, None);
++    assert!(generated.len() < 1000);
++    assert!(generated.contains("10000 commits"));
++    let focus = "Review concurrency and rollback. Vérifier les erreurs.\n\n".repeat(100);
++    let instructions = range_review_instructions(&range, Some(&focus));
++    assert_eq!(
++        instructions,
++        format!("{generated}\n\nAdditional focus: {}", focus.trim())
++    );
++}
++
++#[test]
++fn rejects_divergent_git_range_endpoints() {
++    let repo = tempfile::tempdir().expect("tempdir");
++    git(repo.path(), &["init", "-q"]);
++    let root = commit(repo.path(), "root");
++    let left = commit(repo.path(), "left");
++    git(repo.path(), &["checkout", "--detach", &root]);
++    let right = commit(repo.path(), "right");
++    let error = resolve_git_range(repo.path(), &left, &right).expect_err("divergent endpoints");
++    assert!(error.to_string().contains("ancestor"));
++}
++
++#[test]
++fn jj_ranges_preserve_selection_and_include_current_working_copy() {
++    match Command::new("jj").arg("--version").output() {
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            eprintln!("skipping jj range test: jj is not installed");
++            return;
++        }
++        Ok(output) => assert!(output.status.success(), "jj --version failed"),
++        Err(error) => panic!("failed to check jj: {error}"),
++    }
++    let repo = tempfile::tempdir().expect("tempdir");
++    let dir = repo.path();
++    git(dir, &["init", "-q"]);
++    let base = commit(dir, "base");
++    let one = commit(dir, "one");
++    let two = commit(dir, "two");
++    let three = commit(dir, "three");
++    // Build a side branch and merge without checkout conflicts or shell scripts.
++    let tree = git(dir, &["rev-parse", "HEAD^{tree}"]);
++    let side = git(
++        dir,
++        &[
++            "-c",
++            "user.name=t",
++            "-c",
++            "user.email=t@t",
++            "-c",
++            "commit.gpgSign=false",
++            "commit-tree",
++            tree.trim(),
++            "-p",
++            &base,
++            "-m",
++            "side",
++        ],
++    );
++    let merge = git(
++        dir,
++        &[
++            "-c",
++            "user.name=t",
++            "-c",
++            "user.email=t@t",
++            "-c",
++            "commit.gpgSign=false",
++            "commit-tree",
++            tree.trim(),
++            "-p",
++            &three,
++            "-p",
++            side.trim(),
++            "-m",
++            "merge",
++        ],
++    );
++    git(dir, &["branch", "merge", merge.trim()]);
++    run(dir, "jj", &["git", "init", "--colocate", "."]).expect("init colocated jj");
++    let working_copy = run(
++        dir,
++        "jj",
++        &[
++            "--ignore-working-copy",
++            "log",
++            "--no-graph",
++            "-r",
++            "@",
++            "-T",
++            "commit_id",
++        ],
++    )
++    .expect("working copy ID");
++    let edited_contents = "current working-copy changes";
++    std::fs::write(dir.join("file.txt"), edited_contents).expect("edit working copy");
++    let current = resolve_jj_revset(dir, "@").expect("current working-copy range");
++    let current_id = current.head.clone();
++    assert_ne!(current_id, working_copy.trim());
++    assert_eq!(
++        current,
++        CommitRange {
++            base: three.clone(),
++            head: current_id.clone(),
++            commits: vec![current_id.clone()],
++        }
++    );
++    assert_eq!(
++        git(dir, &["show", &format!("{current_id}:file.txt")]),
++        edited_contents
++    );
++    assert_eq!(
++        std::fs::read_to_string(dir.join("file.txt")).expect("working-copy contents"),
++        edited_contents
++    );
++    let range = resolve_jj_revset(dir, &format!("{one}::{three}")).expect("linear jj range");
++    assert_eq!(
++        range,
++        CommitRange {
++            base,
++            head: three.clone(),
++            commits: vec![one.clone(), two, three.clone()],
++        }
++    );
++    assert!(
++        resolve_jj_revset(dir, &format!("{one} | {three}")).is_err(),
++        "gapped selection"
++    );
++    assert!(
++        resolve_jj_revset(dir, &format!("{one} | {}", side.trim())).is_err(),
++        "branched selection"
++    );
++    assert!(
++        resolve_jj_revset(dir, &format!("{one}::{three} | {}", merge.trim())).is_err(),
++        "merge importing unselected side branch"
++    );
++    assert!(resolve_jj_revset(dir, "none()").is_err(), "empty selection");
++}
+diff --git a/codex-rs/exec/tests/suite/mod.rs b/codex-rs/exec/tests/suite/mod.rs
+index 4f7a3ab89fc91ad3c974f58ea8cd84c7ef74baee..dba10d7719a085a59d0ff471bb170c27afc48780 100644
+--- a/codex-rs/exec/tests/suite/mod.rs
++++ b/codex-rs/exec/tests/suite/mod.rs
+@@ -13,6 +13,7 @@ mod originator;
+ mod output_schema;
+ mod prompt_stdin;
+ mod resume;
++mod review_range;
+ mod sandbox;
+ #[cfg(target_os = "macos")]
+ mod seatbelt;
+diff --git a/codex-rs/exec/tests/suite/review_range.rs b/codex-rs/exec/tests/suite/review_range.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fac743a5080085de66d584375c94a830c3e70ee9
+--- /dev/null
++++ b/codex-rs/exec/tests/suite/review_range.rs
+@@ -0,0 +1,93 @@
++use core_test_support::responses;
++use core_test_support::test_codex_exec::test_codex_exec;
++use pretty_assertions::assert_eq;
++use std::path::Path;
++use std::process::Command;
++
++fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
++    let output = Command::new("git")
++        .current_dir(cwd)
++        .env("JJ_GIT_OK", "1")
++        .args([
++            "-c",
++            "user.name=Review Range Test",
++            "-c",
++            "user.email=test@example.invalid",
++            "-c",
++            "commit.gpgSign=false",
++        ])
++        .args(args)
++        .output()?;
++    anyhow::ensure!(
++        output.status.success(),
++        "git failed: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    Ok(String::from_utf8(output.stdout)?.trim().to_string())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_range_sends_resolved_endpoints_and_focus_without_mutating_checkout()
++-> anyhow::Result<()> {
++    let test = test_codex_exec();
++    let cwd = test.cwd_path();
++    git(cwd, &["init", "-q"])?;
++    std::fs::write(cwd.join("reviewed.txt"), "before\n")?;
++    git(cwd, &["add", "reviewed.txt"])?;
++    git(
++        cwd,
++        &["commit", "-qm", "base subject not needed in model context"],
++    )?;
++    let base = git(cwd, &["rev-parse", "HEAD"])?;
++    std::fs::write(cwd.join("reviewed.txt"), "after\n")?;
++    git(cwd, &["commit", "-qam", "unique-review-range-subject"])?;
++    let head = git(cwd, &["rev-parse", "HEAD"])?;
++    std::fs::write(cwd.join("reviewed.txt"), "uncommitted work\n")?;
++    let before = git(cwd, &["status", "--porcelain"])?;
++
++    let server = responses::start_mock_server().await;
++    let mock = responses::mount_sse_once(
++        &server,
++        responses::sse(vec![
++            responses::ev_response_created("review-response"),
++            responses::ev_assistant_message(
++                "review-message",
++                r#"{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"No issues found.","overall_confidence_score":0.9}"#,
++            ),
++            responses::ev_completed("review-response"),
++        ]),
++    )
++    .await;
++    let focus = "Check cancellation safety. Vérifier les erreurs.\n\n".repeat(40);
++    test.cmd_with_server(&server)
++        .args(["-m", "gpt-5.1", "review", "--range"])
++        .arg(format!("{base}..HEAD"))
++        .arg("-")
++        .write_stdin(focus.clone())
++        .assert()
++        .success();
++
++    let user_messages = mock.single_request().message_input_texts("user");
++    let expected = format!(
++        "Review commit range {base}..{head} (1 commit).\n\nRun `git diff {base} {head}` for combined changes and `git log -p {base}..{head}` for individual commits. Review only this range. Provide prioritized, actionable findings.\n\nAdditional focus: {}",
++        focus.trim()
++    );
++    assert!(
++        user_messages.iter().any(|message| message == &expected),
++        "review request: {user_messages:?}"
++    );
++    assert!(
++        user_messages
++            .iter()
++            .all(|message| !message.contains("unique-review-range-subject"))
++    );
++    assert_eq!(
++        (
++            git(cwd, &["rev-parse", "HEAD"])?,
++            git(cwd, &["status", "--porcelain"])?,
++            std::fs::read_to_string(cwd.join("reviewed.txt"))?
++        ),
++        (head, before, "uncommitted work\n".to_string())
++    );
++    Ok(())
++}

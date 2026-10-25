@@ -2,3 +2,4 @@
 f6aa46b041d244a05968b7cb2c0779b3832b4d6e9b9a0194e513056d2de3aca4  patches/0001-pending-turn-steering.patch
 52d216f675a98c2070c47e656b1817244be1911a5e5f3fbf5551f96d8272ff42  patches/0002-heads-up.patch
 d135f7c78cc2c354577397c97dbd30748d7707d11e0a0162f11bba3d638c91fd  patches/0003-background-command-wakeups.patch
+1300a4931f3baf6fab2f589645b86b21b187f62afc28e15babd7b88f396a3def  patches/0004-review-ranges.patch

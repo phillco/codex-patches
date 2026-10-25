@@ -46,3 +46,21 @@ just fix -p codex-core
 ```
 
 The completion tests cover pending and active sleeps, one-time delivery, initial exec eligibility, and collected/foreground exclusions. Command-execution coverage is Unix-only; Windows behavior and the full workspace suite were not validated for this patch.
+
+## Review ranges
+
+- Patch `0004` applies independently to `BASE`, producing tree `1c0d48c0e8f788440b2a36ccaa35ff63ec9cf434`; all four patches apply together, producing tree `53376fa5d430af232291708cb1adc2b4143808ef`.
+- Adapted from fork commit `57225cd2a0f2`; the updated implementation is checkpointed in fork commit `7d1442b9874932a95038`. The extraction adds Git ancestor validation, exact linear JJ selection with normal working-copy snapshot semantics (`--rev @` includes current edits), and fixed-size generated instructions without enumerated commit subjects. User focus instructions retain the existing unrestricted-length behavior.
+- Coverage includes CLI aliases/conflicts, divergent Git endpoints, JJ gaps/branches/merges and current working-copy edits, long Unicode focus, and a mocked end-to-end review using long stdin focus while preserving a dirty checkout.
+- Exec tests: 169 passed, 0 skipped on the isolated extraction. The initial run caught missing explicit conflicts between range/rev selectors and commit titles; the patch includes the fix and positive commit-title regression coverage.
+- Scoped `just fix -p codex-exec` passed without source changes. `just fmt` and source whitespace checks passed.
+- The updated fork release built on Bedroom Mini from snapshot `3115b4f4cf62f89fd3ab4653f88e346bf1fdf109`; all eight changed exec files match the tested extraction byte-for-byte.
+- Installed the locally Developer ID-signed CLI, Code Mode host, and matching voice helper/runtime. Manifest hashes and signatures passed verification; CLI startup, real Code Mode JavaScript execution, and voice runtime initialization/close passed. The previous installed package is retained for rollback.
+- Installed CLI help, rejection of `--title` with both new selectors, generated Fish completion syntax, and actual range/rev completion queries passed.
+
+```sh
+just test -p codex-exec
+just fix -p codex-exec
+```
+
+The standalone tests use the same macOS Studio runner described above; full workspace and Windows/Linux validation were not performed.
