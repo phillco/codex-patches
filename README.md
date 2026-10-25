@@ -43,6 +43,8 @@ Build Codex using its normal build instructions after applying the patches.
 
 ## Heads Up settings
 
+Actions retain the original numbering: **1 Learn more / Discuss with agent**, **2 Knew this already**, **3 Dismiss**. **4 Send to agent** is appended last.
+
 Toggle reviews with `/heads-up`, or enable them in `config.toml`:
 
 ```toml

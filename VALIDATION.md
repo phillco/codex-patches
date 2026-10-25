@@ -2,7 +2,7 @@
 
 Base: `818f1cca8ccf8899f0f4d59336baebaccf358eed`.
 
-Steering + Heads Up patched source tree: `3ab9f1d4318942b569ffec405642841fc91e720b`.
+Steering + Heads Up patched source tree: `6290eb253c4c9ff5f2fd2c681861f286e0541689`.
 
 - The steering and Heads Up patches apply sequentially to a fresh index at the base; the resulting tree exactly matches the isolated extraction.
 - The optional Stop-hook patch applies independently to the same base; its seven Python tests pass.
@@ -28,10 +28,17 @@ just test -p codex-app-server-protocol
 
 Tests use the fork's Studio build runner with Rust 1.95.0 on macOS. The build runner is validation infrastructure and is not included in the patches. Full workspace tests, Windows/Linux builds, and interactive UI acceptance were not performed. Rendered UI behavior has snapshot coverage.
 
+## Heads Up menu order update (2026-10-25)
+
+- Restored `3 Dismiss` and placed `4 Send to agent` last in both compact and expanded views. Updated the shortcut regression test and five rendered snapshots.
+- All seven exported files match the tested fork files byte-for-byte. The fork's 32 focused Heads Up tests passed, including both-view shortcuts and compact, narrow, and expanded snapshots. The extracted series was not recompiled for this menu-only update.
+- Rechecked all four patches sequentially against a fresh index at `BASE`; independently rechecked patches `0003`, `0004`, and the optional Stop-hook patch. Refreshed the resulting tree IDs above/below and SHA256 checksums.
+- The signed installed fork passed CLI startup, Code Mode execution, and voice-runtime initialization. Full fork TUI testing had 4,648 passes and 36 failures outside Heads Up; the Heads Up snapshot failure in that run was corrected and the focused rerun passed. Interactive UI testing was not performed.
+
 ## Background command wakeups
 
 - Patch `0003` applies independently to `BASE`; its resulting tree exactly matches the isolated extraction: `0fca39fa77d38479913812dfd30a4abd89d244a4`.
-- All three patches also apply sequentially: resulting tree `3213b91dbf05468250e96d05570deabdb037d0a5`.
+- All three patches also apply sequentially: resulting tree `88465b8949cec4a4feaa00ade5202dccf42ceac9`.
 - The patch contains nine core implementation/test files, with no Heads Up dependency or new configuration/dependencies.
 - Rust formatting and whitespace checks pass. An independent review found no blocking concurrency or cancellation issues.
 - Focused standalone tests: 26 sleep-related tests and 3 completion-readiness tests passed (29 total).
@@ -49,7 +56,7 @@ The completion tests cover pending and active sleeps, one-time delivery, initial
 
 ## Review ranges
 
-- Patch `0004` applies independently to `BASE`, producing tree `1c0d48c0e8f788440b2a36ccaa35ff63ec9cf434`; all four patches apply together, producing tree `53376fa5d430af232291708cb1adc2b4143808ef`.
+- Patch `0004` applies independently to `BASE`, producing tree `1c0d48c0e8f788440b2a36ccaa35ff63ec9cf434`; all four patches apply together, producing tree `0f53c116c44cb45ff8191b7a2faf128c837e4a31`.
 - Adapted from fork commit `57225cd2a0f2`; the updated implementation is checkpointed in fork commit `7d1442b9874932a95038`. The extraction adds Git ancestor validation, exact linear JJ selection with normal working-copy snapshot semantics (`--rev @` includes current edits), and fixed-size generated instructions without enumerated commit subjects. User focus instructions retain the existing unrestricted-length behavior.
 - Coverage includes CLI aliases/conflicts, divergent Git endpoints, JJ gaps/branches/merges and current working-copy edits, long Unicode focus, and a mocked end-to-end review using long stdin focus while preserving a dirty checkout.
 - Exec tests: 169 passed, 0 skipped on the isolated extraction. The initial run caught missing explicit conflicts between range/rev selectors and commit titles; the patch includes the fix and positive commit-title regression coverage.

@@ -13130,10 +13130,10 @@ index 00000000000000000000..adaf3191e5dd297f80fa
 +}
 diff --git a/codex-rs/tui/src/bottom_pane/heads_up.rs b/codex-rs/tui/src/bottom_pane/heads_up.rs
 new file mode 100644
-index 00000000000000000000..b8a6cfbef3843502ccdc
+index 00000000000000000000..cf886789fd10bc9767c0
 --- /dev/null
 +++ b/codex-rs/tui/src/bottom_pane/heads_up.rs
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,174 @@
 +//! Optional reviewer findings above the composer, without changing its input or task state.
 +
 +use super::BottomPane;
@@ -13198,9 +13198,9 @@ index 00000000000000000000..b8a6cfbef3843502ccdc
 +        lines.extend(word_wrap_lines(
 +            &[Line::from(
 +                if self.note.expanded {
-+                    "1 Discuss with agent · 2 Knew this already · 3 Send to agent · 4 Dismiss"
++                    "1 Discuss with agent · 2 Knew this already · 3 Dismiss · 4 Send to agent"
 +                } else {
-+                    "1 Learn more · 2 Knew this already · 3 Send to agent · 4 Dismiss"
++                    "1 Learn more · 2 Knew this already · 3 Dismiss · 4 Send to agent"
 +                }
 +                .cyan(),
 +            )],
@@ -13236,6 +13236,7 @@ index 00000000000000000000..b8a6cfbef3843502ccdc
 +        self.request_redraw();
 +        Ok(())
 +    }
++
 +    pub(crate) fn set_heads_up(&mut self, note: Option<HeadsUpNote>) {
 +        self.heads_up = note.map(|note| HeadsUpBand {
 +            note,
@@ -13291,8 +13292,8 @@ index 00000000000000000000..b8a6cfbef3843502ccdc
 +                }
 +            }
 +            KeyCode::Char('2') if band.actions_visible.get() => HeadsUpAction::Knew,
-+            KeyCode::Char('3') if band.actions_visible.get() => HeadsUpAction::SendToAgent,
-+            KeyCode::Char('4') if band.actions_visible.get() => HeadsUpAction::Dismiss,
++            KeyCode::Char('3') if band.actions_visible.get() => HeadsUpAction::Dismiss,
++            KeyCode::Char('4') if band.actions_visible.get() => HeadsUpAction::SendToAgent,
 +            _ => return false,
 +        };
 +        self.app_event_tx.send(AppEvent::HeadsUpAction {
@@ -13309,7 +13310,7 @@ index 00000000000000000000..b8a6cfbef3843502ccdc
 +mod tests;
 diff --git a/codex-rs/tui/src/bottom_pane/heads_up_tests.rs b/codex-rs/tui/src/bottom_pane/heads_up_tests.rs
 new file mode 100644
-index 00000000000000000000..26790e934a26dff4fd49
+index 00000000000000000000..ce271f4bc59d97bb6222
 --- /dev/null
 +++ b/codex-rs/tui/src/bottom_pane/heads_up_tests.rs
 @@ -0,0 +1,232 @@
@@ -13415,8 +13416,8 @@ index 00000000000000000000..26790e934a26dff4fd49
 +        rendered(pane.heads_up.as_ref().unwrap(), /*width*/ 64);
 +
 +        for (key, expected) in [
-+            ('3', HeadsUpAction::SendToAgent),
-+            ('4', HeadsUpAction::Dismiss),
++            ('3', HeadsUpAction::Dismiss),
++            ('4', HeadsUpAction::SendToAgent),
 +        ] {
 +            assert!(
 +                pane.handle_heads_up_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
@@ -13618,7 +13619,7 @@ index 0e7924968f4330bf9bd1..bb1f2e3d55f20bdd1095 100644
                  .as_ref()
 diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_compact.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_compact.snap
 new file mode 100644
-index 00000000000000000000..8ec87ee6d41403d293e1
+index 00000000000000000000..f2b158b27025724bb7de
 --- /dev/null
 +++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_compact.snap
 @@ -0,0 +1,9 @@
@@ -13630,10 +13631,10 @@ index 00000000000000000000..8ec87ee6d41403d293e1
 +Heads Up
 +Payment retries could double-charge customers.
 +
-+1 Learn more · 2 Knew this already · 3 Send to agent · 4 Dismiss
++1 Learn more · 2 Knew this already · 3 Dismiss · 4 Send to agent
 diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_explanation.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_explanation.snap
 new file mode 100644
-index 00000000000000000000..1afcff7df5816e2b798d
+index 00000000000000000000..f3aebb13e19e0bcedb0b
 --- /dev/null
 +++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_explanation.snap
 @@ -0,0 +1,14 @@
@@ -13649,11 +13650,11 @@ index 00000000000000000000..1afcff7df5816e2b798d
 +
 +Keep the same key when retrying the request.
 +
-+1 Discuss with agent · 2 Knew this already · 3 Send to agent · 4
-+Dismiss
++1 Discuss with agent · 2 Knew this already · 3 Dismiss · 4 Send
++to agent
 diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_narrow.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_narrow.snap
 new file mode 100644
-index 00000000000000000000..c53017f2755337bc350e
+index 00000000000000000000..7b2a8b344196f2e63258
 --- /dev/null
 +++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__heads_up__tests__heads_up_narrow.snap
 @@ -0,0 +1,12 @@
@@ -13667,8 +13668,8 @@ index 00000000000000000000..c53017f2755337bc350e
 +charge customers.
 +
 +1 Learn more · 2 Knew this
-+already · 3 Send to agent · 4
-+Dismiss
++already · 3 Dismiss · 4 Send
++to agent
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
 index 7e0ee52b1055a0070c9d..5bd79d1505edbfb2fb20 100644
 --- a/codex-rs/tui/src/chatwidget.rs
@@ -14065,7 +14066,7 @@ index f0dc60073bcc7101a3f6..75d818c4e2d005159606 100644
              | SlashCommand::Statusline
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__heads_up_compact_after_prompt.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__heads_up_compact_after_prompt.snap
 new file mode 100644
-index 00000000000000000000..df72476eaf1c8b184dbf
+index 00000000000000000000..0d1508e476522f6a57b6
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__heads_up_compact_after_prompt.snap
 @@ -0,0 +1,16 @@
@@ -14077,7 +14078,7 @@ index 00000000000000000000..df72476eaf1c8b184dbf
 +Heads Up
 +Keep the backup
 +
-+1 Learn more · 2 Knew this already · 3 Send to agent · 4 Dismiss
++1 Learn more · 2 Knew this already · 3 Dismiss · 4 Send to agent
 +
 +• Working (0s • esc to interrupt)
 +
@@ -14108,7 +14109,7 @@ index 00000000000000000000..93828276174caa2b438d
 +  gpt-5.6-sol default · /tmp/project
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__heads_up_expanded_after_prompt.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__heads_up_expanded_after_prompt.snap
 new file mode 100644
-index 00000000000000000000..dfb17117f11acc269ea4
+index 00000000000000000000..5b2dd6cdb22015ebcd75
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__heads_up_expanded_after_prompt.snap
 @@ -0,0 +1,18 @@
@@ -14122,7 +14123,7 @@ index 00000000000000000000..dfb17117f11acc269ea4
 +
 +It is the only rollback copy.
 +
-+1 Discuss with agent · 2 Knew this already · 3 Send to agent · 4 Dismiss
++1 Discuss with agent · 2 Knew this already · 3 Dismiss · 4 Send to agent
 +
 +• Working (0s • esc to interrupt)
 +
