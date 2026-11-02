@@ -1,0 +1,3580 @@
+diff --git a/codex-rs/analytics/src/analytics_client_tests.rs b/codex-rs/analytics/src/analytics_client_tests.rs
+index 7a49f7221e..2ef4ec377b 100644
+--- a/codex-rs/analytics/src/analytics_client_tests.rs
++++ b/codex-rs/analytics/src/analytics_client_tests.rs
+@@ -352,6 +352,7 @@
+     parent_thread_id: Option<String>,
+ ) -> ClientResponsePayload {
+     ClientResponsePayload::ThreadResume(ThreadResumeResponse {
++        dynamic_tools_registered: None,
+         thread: sample_thread_with_metadata(
+             thread_id,
+             ephemeral,
+diff --git a/codex-rs/analytics/src/client_tests.rs b/codex-rs/analytics/src/client_tests.rs
+index 494c23a358..e14eb428ec 100644
+--- a/codex-rs/analytics/src/client_tests.rs
++++ b/codex-rs/analytics/src/client_tests.rs
+@@ -643,6 +643,7 @@
+ 
+ fn sample_thread_resume_response() -> ClientResponsePayload {
+     ClientResponsePayload::ThreadResume(ThreadResumeResponse {
++        dynamic_tools_registered: None,
+         thread: sample_thread("thread-2"),
+         model: "gpt-5".to_string(),
+         model_provider: "openai".to_string(),
+@@ -664,6 +665,7 @@
+ 
+ fn sample_thread_fork_response() -> ClientResponsePayload {
+     ClientResponsePayload::ThreadFork(ThreadForkResponse {
++        dynamic_tools_registered: None,
+         thread: sample_thread("thread-3"),
+         model: "gpt-5".to_string(),
+         model_provider: "openai".to_string(),
+diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+index 07e5145980..face2340c0 100644
+--- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
++++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+@@ -747,6 +747,7 @@
+     thread.session_id = session_id;
+ 
+     let response = ThreadResumeResponse {
++        dynamic_tools_registered: pending.dynamic_tools_registered,
+         thread,
+         model,
+         model_provider: model_provider_id,
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 172177cdac..dfb95fe7a1 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -291,6 +291,14 @@
+         })
+ }
+ 
++// Optional client tools must never prevent a client from reopening its history.
++// The client can retry the identical request without additions on this error.
++fn dynamic_tool_registration_error(message: impl Into<String>) -> JSONRPCErrorError {
++    let mut error = invalid_request(message);
++    error.data = Some(serde_json::json!({"dynamicToolRegistrationRejected": true}));
++    error
++}
++
+ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
+     const DYNAMIC_TOOL_NAME_MAX_LEN: usize = 128;
+     const DYNAMIC_TOOL_NAMESPACE_MAX_LEN: usize = 64;
+@@ -3664,6 +3672,11 @@
+                 "`permissions` cannot be combined with `sandbox`",
+             ));
+         }
++        if let Some(additions) = params.dynamic_tools.as_deref() {
++            validate_dynamic_tools(additions).map_err(dynamic_tool_registration_error)?;
++            codex_protocol::dynamic_tools::merge_additional_dynamic_tools(&[], additions)
++                .map_err(dynamic_tool_registration_error)?;
++        }
+         let redact_resume_payloads =
+             should_redact_thread_resume_payloads(app_server_client_name.as_deref());
+ 
+@@ -3699,6 +3712,7 @@
+         };
+ 
+         let ThreadResumeParams {
++            dynamic_tools,
+             thread_id,
+             history,
+             path,
+@@ -3825,6 +3839,14 @@
+             };
+         }
+ 
++        if let Some(additions) = dynamic_tools.as_deref() {
++            codex_protocol::dynamic_tools::merge_additional_dynamic_tools(
++                &thread_history.get_dynamic_tools().unwrap_or_default(),
++                additions,
++            )
++            .map_err(dynamic_tool_registration_error)?;
++        }
++
+         // Copied or referenced history can contain another thread's settings. Only snapshots
+         // explicitly owned by this thread can override its startup cwd and workspace folders.
+         let history_settings = if let InitialHistory::Resumed(resumed) = &thread_history {
+@@ -4001,6 +4023,12 @@
+                         .await?;
+                     return Ok(ControlFlow::Break(()));
+                 };
++                if let Some(additions) = dynamic_tools.as_deref() {
++                    codex_thread
++                        .register_dynamic_tools(additions)
++                        .await
++                        .map_err(dynamic_tool_registration_error)?;
++                }
+                 let request_id = request_id.clone();
+                 if let Err(err) = Self::set_app_server_client_info(
+                     codex_thread.as_ref(),
+@@ -4163,6 +4191,7 @@
+ 
+                 let thread_originator = config_snapshot.originator.clone();
+                 let response = ThreadResumeResponse {
++                    dynamic_tools_registered: dynamic_tools.as_ref().map(|_| true),
+                     thread,
+                     model: session_configured.model,
+                     model_provider: session_configured.model_provider_id,
+@@ -4514,10 +4543,24 @@
+             };
+             let resume_cursor_store = paginated_resume.then(|| Arc::clone(&self.thread_store));
+ 
++            let dynamic_tools_registered = if let Some(additions) = params.dynamic_tools.as_deref()
++                && can_accept_direct_input(
++                    existing_thread.multi_agent_version(),
++                    &config_snapshot.session_source,
++                ) {
++                existing_thread
++                    .register_dynamic_tools(additions)
++                    .await
++                    .map_err(dynamic_tool_registration_error)?;
++                Some(true)
++            } else {
++                None
++            };
+             let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+             let command = crate::thread_state::ThreadListenerCommand::SendThreadResumeResponse {
+                 request: Box::new(crate::thread_state::PendingThreadResumeRequest {
+                     request_id: request_id.clone(),
++                    dynamic_tools_registered,
+                     history_items,
+                     cold_resume_token_usage_turn_id,
+                     config_snapshot,
+@@ -4854,6 +4897,7 @@
+         client_mcp_extensions: ClientMcpExtensions,
+     ) -> Result<(), JSONRPCErrorError> {
+         let ThreadForkParams {
++            dynamic_tools,
+             thread_id,
+             last_turn_id,
+             before_turn_id,
+@@ -4875,6 +4919,11 @@
+             exclude_turns,
+             defer_goal_continuation,
+         } = params;
++        if let Some(additions) = dynamic_tools.as_deref() {
++            validate_dynamic_tools(additions).map_err(dynamic_tool_registration_error)?;
++            codex_protocol::dynamic_tools::merge_additional_dynamic_tools(&[], additions)
++                .map_err(dynamic_tool_registration_error)?;
++        }
+         let include_turns = !exclude_turns;
+         if sandbox.is_some() && permissions.is_some() {
+             return Err(invalid_request(
+@@ -4970,6 +5019,18 @@
+                     })?,
+             )
+         };
++        if let Some(additions) = dynamic_tools.as_deref() {
++            let inherited = InitialHistory::Resumed(ResumedHistory {
++                conversation_id: source_thread_id,
++                history: Arc::clone(&source_history_items),
++                rollout_path: None,
++            });
++            codex_protocol::dynamic_tools::merge_additional_dynamic_tools(
++                &inherited.get_dynamic_tools().unwrap_or_default(),
++                additions,
++            )
++            .map_err(dynamic_tool_registration_error)?;
++        }
+         let history_cwd = Some(source_thread.cwd.clone());
+ 
+         // Persist Windows sandbox mode.
+@@ -5209,6 +5270,12 @@
+             }
+         };
+ 
++        if let Some(additions) = dynamic_tools.as_deref() {
++            forked_thread
++                .register_dynamic_tools(additions)
++                .await
++                .map_err(dynamic_tool_registration_error)?;
++        }
+         Self::set_app_server_client_info(
+             forked_thread.as_ref(),
+             app_server_client_name,
+@@ -5355,6 +5422,7 @@
+             thread_response_active_permission_profile(config_snapshot.active_permission_profile);
+         let thread_originator = config_snapshot.originator.clone();
+         let response = ThreadForkResponse {
++            dynamic_tools_registered: dynamic_tools.as_ref().map(|_| true),
+             thread: thread.clone(),
+             model: session_configured.model,
+             model_provider: session_configured.model_provider_id,
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index 875306fdb4..f59260fbcd 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -659,6 +659,7 @@
+     fn collect_resume_override_mismatches_includes_service_tier() {
+         let cwd = test_path_buf("/tmp").abs();
+         let request = ThreadResumeParams {
++            dynamic_tools: None,
+             thread_id: "thread-1".to_string(),
+             history: None,
+             path: None,
+diff --git a/codex-rs/app-server/src/thread_state.rs b/codex-rs/app-server/src/thread_state.rs
+index ba011dd73a..540297fe45 100644
+--- a/codex-rs/app-server/src/thread_state.rs
++++ b/codex-rs/app-server/src/thread_state.rs
+@@ -34,6 +34,7 @@
+ type PendingInterruptQueue = Vec<ConnectionRequestId>;
+ 
+ pub(crate) struct PendingThreadResumeRequest {
++    pub(crate) dynamic_tools_registered: Option<bool>,
+     pub(crate) request_id: ConnectionRequestId,
+     pub(crate) history_items: Vec<RolloutItem>,
+     /// Usage attribution already resolved while cold-loading a paginated child.
+diff --git a/codex-rs/app-server/tests/suite/v2/dynamic_tool_registration_tests.rs b/codex-rs/app-server/tests/suite/v2/dynamic_tool_registration_tests.rs
+new file mode 100644
+index 0000000000..0aa561c8d0
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/dynamic_tool_registration_tests.rs
+@@ -0,0 +1,306 @@
++//! Registration on a pre-feature conversation retains its model-visible history.
++use anyhow::Context;
++use anyhow::Result;
++use app_test_support::MockResponsesConfig;
++use app_test_support::TestAppServer;
++use app_test_support::create_mock_responses_server_repeating_assistant;
++use codex_app_server_protocol::DynamicToolFunctionSpec;
++use codex_app_server_protocol::DynamicToolSpec;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ThreadForkParams;
++use codex_app_server_protocol::ThreadForkResponse;
++use codex_app_server_protocol::ThreadHistoryMode;
++use codex_app_server_protocol::ThreadResumeParams;
++use codex_app_server_protocol::ThreadResumeResponse;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::TurnStartParams;
++use codex_app_server_protocol::TurnStartResponse;
++use codex_app_server_protocol::UserInput;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use std::time::Duration;
++use tempfile::TempDir;
++use tokio::time::timeout;
++
++const DEADLINE: Duration = Duration::from_secs(/*secs*/ 60);
++
++fn tool(name: &str) -> DynamicToolSpec {
++    DynamicToolSpec::Function(DynamicToolFunctionSpec {
++        name: name.to_string(),
++        description: "Client scheduling tool".to_string(),
++        input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
++        defer_loading: false,
++    })
++}
++
++async fn complete_turn(server: &mut TestAppServer, thread_id: &str, text: &str) -> Result<()> {
++    let request = server
++        .send_turn_start_request(TurnStartParams {
++            thread_id: thread_id.to_string(),
++            input: vec![UserInput::Text {
++                text: text.to_string(),
++                text_elements: vec![],
++            }],
++            ..Default::default()
++        })
++        .await?;
++    let _: TurnStartResponse = timeout(DEADLINE, server.read_response(request)).await??;
++    timeout(
++        DEADLINE,
++        server.read_stream_until_notification_message("turn/completed"),
++    )
++    .await??;
++    Ok(())
++}
++
++enum ResumeKind {
++    Live,
++    Cold,
++}
++
++async fn resume_existing_conversation(kind: ResumeKind) -> Result<()> {
++    let model = create_mock_responses_server_repeating_assistant("Done").await;
++    let home = TempDir::new()?;
++    MockResponsesConfig::new(&model.uri()).write(home.path())?;
++    let mut server = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .build_initialized()
++        .await?;
++    // This conversation predates the loop tool; it already owns another client tool.
++    let started = server
++        .start_thread(ThreadStartParams {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            dynamic_tools: Some(vec![tool("existing_tool")]),
++            ..Default::default()
++        })
++        .await?;
++    let thread_id = started.thread.id;
++    complete_turn(
++        &mut server,
++        &thread_id,
++        "remember the original conversation marker",
++    )
++    .await?;
++    if matches!(kind, ResumeKind::Cold) {
++        timeout(DEADLINE, server.shutdown_gracefully()).await??;
++        server = TestAppServer::builder()
++            .with_codex_home(home.path())
++            .build_initialized()
++            .await?;
++    }
++    let params = ThreadResumeParams {
++        thread_id: thread_id.clone(),
++        dynamic_tools: Some(vec![tool("schedule_loop")]),
++        ..Default::default()
++    };
++    // Repeating resume is an idempotent attach, including after cold loading.
++    for _ in 0..2 {
++        let request = server.send_thread_resume_request(params.clone()).await?;
++        let response: ThreadResumeResponse =
++            timeout(DEADLINE, server.read_response(request)).await??;
++        assert_eq!(response.dynamic_tools_registered, Some(true));
++        assert_eq!(response.thread.id, thread_id);
++        assert!(!response.thread.turns.is_empty());
++    }
++    // A collision rejects the whole request, including an earlier fresh addition.
++    let mut collision = tool("existing_tool");
++    let DynamicToolSpec::Function(function) = &mut collision else {
++        unreachable!()
++    };
++    function.description = "conflicting definition".to_string();
++    for additions in [
++        vec![tool("must_not_register"), collision],
++        vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
++            input_schema: json!({"type":"null"}),
++            ..match tool("invalid_schema") {
++                DynamicToolSpec::Function(f) => f,
++                DynamicToolSpec::Namespace(_) => unreachable!(),
++            }
++        })],
++    ] {
++        let request = server
++            .send_thread_resume_request(ThreadResumeParams {
++                dynamic_tools: Some(additions),
++                ..params.clone()
++            })
++            .await?;
++        let error = timeout(
++            DEADLINE,
++            server.read_stream_until_error_message(RequestId::Integer(request)),
++        )
++        .await??;
++        assert_eq!(error.error.code, -32600);
++        assert_eq!(
++            error.error.data,
++            Some(json!({"dynamicToolRegistrationRejected": true}))
++        );
++    }
++    complete_turn(&mut server, &thread_id, "continue in the same conversation").await?;
++    let request = server
++        .send_thread_fork_request(ThreadForkParams {
++            thread_id: thread_id.clone(),
++            dynamic_tools: Some(vec![tool("fork_tool")]),
++            ..Default::default()
++        })
++        .await?;
++    let fork: ThreadForkResponse = timeout(DEADLINE, server.read_response(request)).await??;
++    assert_eq!(fork.dynamic_tools_registered, Some(true));
++    assert_ne!(fork.thread.id, thread_id);
++    complete_turn(&mut server, &fork.thread.id, "continue the fork").await?;
++    let requests = model.received_requests().await.context("model requests")?;
++    let bodies = requests
++        .iter()
++        .filter(|request| request.url.path().ends_with("/responses"))
++        .map(wiremock::Request::body_json::<Value>)
++        .collect::<std::result::Result<Vec<_>, _>>()?;
++    assert_eq!(bodies.len(), 3);
++    let names = |body: &Value| {
++        body["tools"]
++            .as_array()
++            .expect("model request includes a tools array")
++            .iter()
++            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
++            .collect::<Vec<_>>()
++    };
++    let resumed_names = names(&bodies[1]);
++    assert!(resumed_names.contains(&"existing_tool".to_string()));
++    assert_eq!(
++        resumed_names
++            .iter()
++            .filter(|name| *name == "schedule_loop")
++            .count(),
++        1
++    );
++    assert!(!resumed_names.contains(&"must_not_register".to_string()));
++    let fork_names = names(&bodies[2]);
++    assert!(fork_names.contains(&"existing_tool".to_string()));
++    assert!(fork_names.contains(&"fork_tool".to_string()));
++    for body in &bodies[1..] {
++        assert!(
++            body["input"]
++                .to_string()
++                .contains("original conversation marker")
++        );
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn live_resume_adds_tools_without_replacing_history_or_other_tools() -> Result<()> {
++    resume_existing_conversation(ResumeKind::Live).await
++}
++
++#[tokio::test]
++async fn cold_resume_adds_tools_without_replacing_history_or_other_tools() -> Result<()> {
++    resume_existing_conversation(ResumeKind::Cold).await
++}
++
++#[tokio::test]
++async fn legacy_registry_at_limit_remains_resumable_and_forkable_without_additions() -> Result<()> {
++    let model = create_mock_responses_server_repeating_assistant("Done").await;
++    let home = TempDir::new()?;
++    MockResponsesConfig::new(&model.uri()).write(home.path())?;
++    let mut server = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .build_initialized()
++        .await?;
++    let legacy_tools = (0..64).map(|n| tool(&format!("legacy_tool_{n}"))).collect();
++    let started = server
++        .start_thread(ThreadStartParams {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            dynamic_tools: Some(legacy_tools),
++            ..Default::default()
++        })
++        .await?;
++    let thread_id = started.thread.id;
++    complete_turn(&mut server, &thread_id, "legacy conversation marker").await?;
++    for cold in [false, true] {
++        if cold {
++            timeout(DEADLINE, server.shutdown_gracefully()).await??;
++            server = TestAppServer::builder()
++                .with_codex_home(home.path())
++                .build_initialized()
++                .await?;
++        }
++        let request = server
++            .send_thread_resume_request(ThreadResumeParams {
++                thread_id: thread_id.clone(),
++                dynamic_tools: Some(vec![tool("schedule_loop")]),
++                ..Default::default()
++            })
++            .await?;
++        let error = timeout(
++            DEADLINE,
++            server.read_stream_until_error_message(RequestId::Integer(request)),
++        )
++        .await??;
++        assert_eq!(
++            error.error.data,
++            Some(json!({"dynamicToolRegistrationRejected": true}))
++        );
++        let request = server
++            .send_thread_resume_request(ThreadResumeParams {
++                thread_id: thread_id.clone(),
++                ..Default::default()
++            })
++            .await?;
++        let resumed: ThreadResumeResponse =
++            timeout(DEADLINE, server.read_response(request)).await??;
++        assert_eq!(resumed.thread.id, thread_id);
++        assert_eq!(resumed.dynamic_tools_registered, None);
++        assert!(!resumed.thread.turns.is_empty());
++        complete_turn(&mut server, &thread_id, "continue legacy conversation").await?;
++    }
++    let request = server
++        .send_thread_fork_request(ThreadForkParams {
++            thread_id: thread_id.clone(),
++            dynamic_tools: Some(vec![tool("schedule_loop")]),
++            ..Default::default()
++        })
++        .await?;
++    let error = timeout(
++        DEADLINE,
++        server.read_stream_until_error_message(RequestId::Integer(request)),
++    )
++    .await??;
++    assert_eq!(
++        error.error.data,
++        Some(json!({"dynamicToolRegistrationRejected": true}))
++    );
++    let request = server
++        .send_thread_fork_request(ThreadForkParams {
++            thread_id,
++            ..Default::default()
++        })
++        .await?;
++    let fork: ThreadForkResponse = timeout(DEADLINE, server.read_response(request)).await??;
++    assert_eq!(fork.dynamic_tools_registered, None);
++    complete_turn(&mut server, &fork.thread.id, "continue legacy fork").await?;
++    let requests = model.received_requests().await.context("model requests")?;
++    let bodies = requests
++        .iter()
++        .filter(|request| request.url.path().ends_with("/responses"))
++        .map(wiremock::Request::body_json::<Value>)
++        .collect::<std::result::Result<Vec<_>, _>>()?;
++    assert_eq!(bodies.len(), 4);
++    for body in bodies {
++        let tools = body["tools"].as_array().context("tool registry")?;
++        assert_eq!(
++            tools
++                .iter()
++                .filter(|tool| tool["name"]
++                    .as_str()
++                    .is_some_and(|name| name.starts_with("legacy_tool_")))
++                .count(),
++            64
++        );
++        assert!(!tools.iter().any(|tool| tool["name"] == "schedule_loop"));
++        assert!(
++            body["input"]
++                .to_string()
++                .contains("legacy conversation marker")
++        );
++    }
++    Ok(())
++}
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+index fab78952c9..e59b2570bf 100644
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -30,6 +30,8 @@
+ mod cyber_access_program;
+ mod daemon_update_recovery;
+ mod daybreak_access;
++#[path = "dynamic_tool_registration_tests.rs"]
++mod dynamic_tool_registration;
+ mod dynamic_tools;
+ mod environment_add;
+ mod environment_info;
+diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json
+index 6908b54cb8..6c3be8ca6a 100644
+--- a/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json
++++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json
+@@ -63,6 +63,103 @@
+         }
+       ]
+     },
++    "DynamicToolNamespaceTool": {
++      "oneOf": [
++        {
++          "properties": {
++            "deferLoading": {
++              "type": "boolean"
++            },
++            "description": {
++              "type": "string"
++            },
++            "inputSchema": true,
++            "name": {
++              "type": "string"
++            },
++            "type": {
++              "enum": [
++                "function"
++              ],
++              "title": "FunctionDynamicToolNamespaceToolType",
++              "type": "string"
++            }
++          },
++          "required": [
++            "description",
++            "inputSchema",
++            "name",
++            "type"
++          ],
++          "title": "FunctionDynamicToolNamespaceTool",
++          "type": "object"
++        }
++      ]
++    },
++    "DynamicToolSpec": {
++      "oneOf": [
++        {
++          "properties": {
++            "deferLoading": {
++              "type": "boolean"
++            },
++            "description": {
++              "type": "string"
++            },
++            "inputSchema": true,
++            "name": {
++              "type": "string"
++            },
++            "type": {
++              "enum": [
++                "function"
++              ],
++              "title": "FunctionDynamicToolSpecType",
++              "type": "string"
++            }
++          },
++          "required": [
++            "description",
++            "inputSchema",
++            "name",
++            "type"
++          ],
++          "title": "FunctionDynamicToolSpec",
++          "type": "object"
++        },
++        {
++          "properties": {
++            "description": {
++              "type": "string"
++            },
++            "name": {
++              "type": "string"
++            },
++            "tools": {
++              "items": {
++                "$ref": "#/definitions/DynamicToolNamespaceTool"
++              },
++              "type": "array"
++            },
++            "type": {
++              "enum": [
++                "namespace"
++              ],
++              "title": "NamespaceDynamicToolSpecType",
++              "type": "string"
++            }
++          },
++          "required": [
++            "description",
++            "name",
++            "tools",
++            "type"
++          ],
++          "title": "NamespaceDynamicToolSpec",
++          "type": "object"
++        }
++      ]
++    },
+     "SandboxMode": {
+       "enum": [
+         "read-only",
+diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeParams.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeParams.json
+index 5c35287d0e..f2ebaae2f2 100644
+--- a/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeParams.json
++++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadResumeParams.json
+@@ -213,6 +213,103 @@
+         }
+       ]
+     },
++    "DynamicToolNamespaceTool": {
++      "oneOf": [
++        {
++          "properties": {
++            "deferLoading": {
++              "type": "boolean"
++            },
++            "description": {
++              "type": "string"
++            },
++            "inputSchema": true,
++            "name": {
++              "type": "string"
++            },
++            "type": {
++              "enum": [
++                "function"
++              ],
++              "title": "FunctionDynamicToolNamespaceToolType",
++              "type": "string"
++            }
++          },
++          "required": [
++            "description",
++            "inputSchema",
++            "name",
++            "type"
++          ],
++          "title": "FunctionDynamicToolNamespaceTool",
++          "type": "object"
++        }
++      ]
++    },
++    "DynamicToolSpec": {
++      "oneOf": [
++        {
++          "properties": {
++            "deferLoading": {
++              "type": "boolean"
++            },
++            "description": {
++              "type": "string"
++            },
++            "inputSchema": true,
++            "name": {
++              "type": "string"
++            },
++            "type": {
++              "enum": [
++                "function"
++              ],
++              "title": "FunctionDynamicToolSpecType",
++              "type": "string"
++            }
++          },
++          "required": [
++            "description",
++            "inputSchema",
++            "name",
++            "type"
++          ],
++          "title": "FunctionDynamicToolSpec",
++          "type": "object"
++        },
++        {
++          "properties": {
++            "description": {
++              "type": "string"
++            },
++            "name": {
++              "type": "string"
++            },
++            "tools": {
++              "items": {
++                "$ref": "#/definitions/DynamicToolNamespaceTool"
++              },
++              "type": "array"
++            },
++            "type": {
++              "enum": [
++                "namespace"
++              ],
++              "title": "NamespaceDynamicToolSpecType",
++              "type": "string"
++            }
++          },
++          "required": [
++            "description",
++            "name",
++            "tools",
++            "type"
++          ],
++          "title": "NamespaceDynamicToolSpec",
++          "type": "object"
++        }
++      ]
++    },
+     "FunctionCallOutputBody": {
+       "anyOf": [
+         {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+index 8aacd48a8f..1e6e0af627 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+@@ -271,6 +271,7 @@
+ #[test]
+ fn thread_resume_response_round_trips_initial_turns_page() {
+     let response = ThreadResumeResponse {
++        dynamic_tools_registered: None,
+         thread: Thread {
+             originator: Some("future_client".to_string()),
+             environments: Some(vec![ThreadEnvironment {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+index 28ca20f7b4..334bd95222 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -335,6 +335,18 @@
+ pub struct ThreadResumeParams {
+     pub thread_id: String,
+ 
++    /// Add client-scoped tools to this runtime without rewriting history. Identical
++    /// registrations are idempotent; conflicting names fail. Re-register after a
++    /// cold resume. Additions are limited to 8 KiB; the merged registry to 64
++    /// callable tools and 64 KiB. Existing tools remain available.
++    #[experimental("thread/resume.dynamicTools")]
++    #[serde(
++        default,
++        deserialize_with = "codex_protocol::dynamic_tools::deserialize_dynamic_tool_specs"
++    )]
++    #[ts(optional = nullable)]
++    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
++
+     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
+     /// If specified, the thread will be resumed with the provided history
+     /// instead of loaded from disk.
+@@ -414,6 +426,11 @@
+ #[ts(export_to = "v2/")]
+ pub struct ThreadResumeResponse {
+     pub thread: Thread,
++    /// True when requested dynamic tools were registered for future turns.
++    /// Absent on servers that do not support resume-time registration.
++    #[experimental("thread/resume.dynamicTools")]
++    #[serde(default)]
++    pub dynamic_tools_registered: Option<bool>,
+     pub model: String,
+     pub model_provider: String,
+     pub service_tier: Option<String>,
+@@ -518,6 +535,18 @@
+ pub struct ThreadForkParams {
+     pub thread_id: String,
+ 
++    /// Add client-scoped tools to the fork, preserving persisted tools and history.
++    /// Transient tools from the source runtime must be registered again here.
++    /// Identical registrations are idempotent; conflicting names fail. Additions
++    /// are limited to 8 KiB; the merged registry to 64 callable tools and 64 KiB.
++    #[experimental("thread/fork.dynamicTools")]
++    #[serde(
++        default,
++        deserialize_with = "codex_protocol::dynamic_tools::deserialize_dynamic_tool_specs"
++    )]
++    #[ts(optional = nullable)]
++    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
++
+     /// Optional last turn id to fork through, inclusive.
+     ///
+     /// When specified, turns after `last_turn_id` are omitted from the fork.
+@@ -605,6 +634,10 @@
+ #[ts(export_to = "v2/")]
+ pub struct ThreadForkResponse {
+     pub thread: Thread,
++    /// True when requested dynamic tools were registered for future turns.
++    #[experimental("thread/fork.dynamicTools")]
++    #[serde(default)]
++    pub dynamic_tools_registered: Option<bool>,
+     pub model: String,
+     pub model_provider: String,
+     pub service_tier: Option<String>,
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+index 7177740fea..202bd2a153 100644
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -755,6 +755,16 @@
+         self.session.thread_config_snapshot().await
+     }
+ 
++    /// Add client-scoped tools for future turns without changing existing history.
++    /// Identical registrations are idempotent; collisions fail atomically.
++    /// Clients must re-register additions when loading a new runtime from disk.
++    pub async fn register_dynamic_tools(
++        &self,
++        additions: &[codex_protocol::dynamic_tools::DynamicToolSpec],
++    ) -> Result<(), String> {
++        self.session.register_dynamic_tools(additions).await
++    }
++
+     /// Returns the active turn's reviewer, including live updates, or the thread default.
+     pub async fn approvals_reviewer_for_turn(&self, turn_id: &str) -> ApprovalsReviewer {
+         if let Some((turn, settings, _)) = self
+diff --git a/codex-rs/core/src/session/dynamic_tool_registration.rs b/codex-rs/core/src/session/dynamic_tool_registration.rs
+new file mode 100644
+index 0000000000..1c2a1df8e3
+--- /dev/null
++++ b/codex-rs/core/src/session/dynamic_tool_registration.rs
+@@ -0,0 +1,19 @@
++//! Client tools registered on an existing runtime apply only to future turns.
++use super::session::Session;
++use codex_protocol::dynamic_tools::DynamicToolSpec;
++
++impl Session {
++    #[tracing::instrument(level = "trace", skip_all)]
++    pub(crate) async fn register_dynamic_tools(
++        &self,
++        additions: &[DynamicToolSpec],
++    ) -> Result<(), String> {
++        let mut state = self.state.lock().await;
++        state.session_configuration.dynamic_tools =
++            codex_protocol::dynamic_tools::merge_additional_dynamic_tools(
++                &state.session_configuration.dynamic_tools,
++                additions,
++            )?;
++        Ok(())
++    }
++}
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 98bfa792b2..ae23a40dd6 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -222,6 +222,7 @@
+ 
+ mod code_mode_warning;
+ pub(crate) mod context_window;
++mod dynamic_tool_registration;
+ mod environment;
+ pub(crate) mod extension_metrics;
+ mod handlers;
+diff --git a/codex-rs/protocol/src/dynamic_tool_registration_tests.rs b/codex-rs/protocol/src/dynamic_tool_registration_tests.rs
+new file mode 100644
+index 0000000000..0efc40bd93
+--- /dev/null
++++ b/codex-rs/protocol/src/dynamic_tool_registration_tests.rs
+@@ -0,0 +1,55 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn tool(name: &str) -> DynamicToolSpec {
++    DynamicToolSpec::Function(DynamicToolFunctionSpec {
++        name: name.into(),
++        description: "small".into(),
++        input_schema: json!({"type":"object"}),
++        defer_loading: false,
++    })
++}
++
++#[test]
++fn additions_preserve_tools_are_idempotent_and_reject_collisions() {
++    let existing = vec![tool("existing")];
++    let registered =
++        merge_additional_dynamic_tools(&existing, &[tool("new")]).expect("valid registration");
++    assert_eq!(registered, vec![tool("existing"), tool("new")]);
++    assert_eq!(
++        merge_additional_dynamic_tools(&registered, &[tool("new")]).expect("valid registration"),
++        registered
++    );
++    let mut collision = tool("existing");
++    let DynamicToolSpec::Function(function) = &mut collision else {
++        unreachable!()
++    };
++    function.description = "different".into();
++    assert!(merge_additional_dynamic_tools(&existing, &[tool("new"), collision]).is_err());
++    let namespace = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
++        name: "existing".into(),
++        description: String::new(),
++        tools: vec![],
++    });
++    assert!(merge_additional_dynamic_tools(&existing, &[namespace]).is_err());
++    assert_eq!(existing, vec![tool("existing")]);
++}
++
++#[test]
++fn bounds_addition_bytes_and_accumulated_callable_count_and_bytes() {
++    let mut huge = tool("huge");
++    let DynamicToolSpec::Function(function) = &mut huge else {
++        unreachable!()
++    };
++    function.description = "x".repeat(/*n*/ 8192);
++    assert!(merge_additional_dynamic_tools(&[], &[huge]).is_err());
++    let existing: Vec<_> = (0..64).map(|n| tool(&format!("tool{n}"))).collect();
++    assert!(merge_additional_dynamic_tools(&existing, &[tool("overflow")]).is_err());
++    let oversized = vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
++        name: "large".into(),
++        description: "x".repeat(/*n*/ 65536),
++        tools: vec![],
++    })];
++    assert!(merge_additional_dynamic_tools(&oversized, &[tool("new")]).is_err());
++}
+diff --git a/codex-rs/protocol/src/dynamic_tools.rs b/codex-rs/protocol/src/dynamic_tools.rs
+index bbe92b8fe0..037481e9a6 100644
+--- a/codex-rs/protocol/src/dynamic_tools.rs
++++ b/codex-rs/protocol/src/dynamic_tools.rs
+@@ -42,6 +42,63 @@
+     Function(DynamicToolFunctionSpec),
+ }
+ 
++/// Merge client-scoped tool additions without replacing existing tools.
++///
++/// Identical registrations are idempotent. A name already owned by a different
++/// function or namespace is rejected, and callers must publish only the complete
++/// successful result. Each request is limited to 8 KiB; the resulting registry
++/// is limited to 64 callable tools and 64 KiB of serialized specifications.
++pub fn merge_additional_dynamic_tools(
++    existing: &[DynamicToolSpec],
++    additions: &[DynamicToolSpec],
++) -> Result<Vec<DynamicToolSpec>, String> {
++    if serde_json::to_vec(additions)
++        .map_err(|error| error.to_string())?
++        .len()
++        > 8 * 1024
++    {
++        return Err("dynamic tool additions exceed 8 KiB".to_string());
++    }
++    let name = |tool: &DynamicToolSpec| match tool {
++        DynamicToolSpec::Function(function) => function.name.clone(),
++        DynamicToolSpec::Namespace(namespace) => namespace.name.clone(),
++    };
++    let mut merged = existing.to_vec();
++    for addition in additions {
++        if let Some(previous) = merged.iter().find(|tool| name(tool) == name(addition)) {
++            if previous != addition {
++                return Err(format!(
++                    "dynamic tool name already registered: {}",
++                    name(addition)
++                ));
++            }
++        } else {
++            merged.push(addition.clone());
++        }
++    }
++    let callable_count: usize = merged
++        .iter()
++        .map(|tool| match tool {
++            DynamicToolSpec::Function(_) => 1,
++            DynamicToolSpec::Namespace(namespace) => namespace.tools.len(),
++        })
++        .sum();
++    if merged.len() > 64
++        || callable_count > 64
++        || serde_json::to_vec(&merged)
++            .map_err(|error| error.to_string())?
++            .len()
++            > 64 * 1024
++    {
++        return Err("dynamic tool registry exceeds 64 tools or 64 KiB".to_string());
++    }
++    Ok(merged)
++}
++
++#[cfg(test)]
++#[path = "dynamic_tool_registration_tests.rs"]
++mod registration_tests;
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ pub struct DynamicToolCallRequest {
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+index a8317b3145..07427e3ed6 100644
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -394,6 +394,22 @@
+         request: ServerRequest,
+     ) {
+         if let ServerRequest::DynamicToolCall { request_id, params } = &request {
++            if params.namespace.is_none() && params.tool == crate::prompt_loop_tool::TOOL_NAME {
++                let result = if self.reconnect.offline {
++                    Err("Loop scheduling is unavailable while disconnected.".to_string())
++                } else {
++                    self.chat_widget.apply_prompt_loop_action(
++                        &params.thread_id,
++                        &params.turn_id,
++                        params.arguments.clone(),
++                    )
++                };
++                self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
++                    request_id: request_id.clone(),
++                    response: crate::prompt_loop_tool::response(result),
++                });
++                return;
++            }
+             if self.dynamic_tool_tasks.contains_key(request_id)
+                 || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)
+                     && !app_server_client.uses_embedded_app_server())
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index bcd076f26f..860dce39c2 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -645,6 +645,12 @@
+                 self.reset_for_thread_switch(tui)?;
+                 self.pending_thread_switch_resets -= 1;
+             }
++            AppEvent::BeginQuietLoop { thread_id, run_id, expected_users } => {
++                self.begin_quiet_loop(thread_id, run_id, expected_users);
++            }
++            AppEvent::FinishQuietLoop { thread_id, run_id, summary } => {
++                self.finish_quiet_loop(tui, thread_id, run_id, summary)?;
++            }
+             AppEvent::InsertHistoryCell(cell) => {
+                 self.insert_history_cell(tui, cell);
+             }
+diff --git a/codex-rs/tui/src/app/quiet_loop.rs b/codex-rs/tui/src/app/quiet_loop.rs
+new file mode 100644
+index 0000000000..3a8d6fba36
+--- /dev/null
++++ b/codex-rs/tui/src/app/quiet_loop.rs
+@@ -0,0 +1,84 @@
++//! Only locally initiated, completed automatic turns may collapse their presentation.
++use super::*;
++
++pub(super) struct QuietLoopRun {
++    thread_id: ThreadId,
++    run_id: String,
++    start: usize,
++    expected_users: usize,
++    anchor: Arc<dyn HistoryCell>,
++}
++
++impl App {
++    pub(super) fn begin_quiet_loop(
++        &mut self,
++        thread_id: ThreadId,
++        run_id: String,
++        expected_users: usize,
++    ) {
++        if self.chat_widget.thread_id() != Some(thread_id) {
++            return;
++        }
++        if let Some(old) = self.quiet_loop_run.take()
++            && self
++                .transcript_cells
++                .get(old.start)
++                .is_some_and(|cell| Arc::ptr_eq(cell, &old.anchor))
++        {
++            self.transcript_cells.remove(old.start);
++        }
++        // An invisible identity anchor fails open if pagination/backtrack changes the range.
++        let anchor: Arc<dyn HistoryCell> =
++            Arc::new(history_cell::PlainHistoryCell::new(Vec::new()));
++        self.quiet_loop_run = Some(QuietLoopRun {
++            thread_id,
++            run_id,
++            start: self.transcript_cells.len(),
++            expected_users,
++            anchor: anchor.clone(),
++        });
++        self.transcript_cells.push(anchor);
++    }
++    pub(super) fn finish_quiet_loop(
++        &mut self,
++        tui: &mut tui::Tui,
++        thread_id: ThreadId,
++        run_id: String,
++        summary: Option<String>,
++    ) -> Result<()> {
++        let Some(run) = self.quiet_loop_run.as_ref() else {
++            return Ok(());
++        };
++        if run.thread_id != thread_id
++            || run.run_id != run_id
++            || self.chat_widget.thread_id() != Some(thread_id)
++            || !self
++                .transcript_cells
++                .get(run.start)
++                .is_some_and(|cell| Arc::ptr_eq(cell, &run.anchor))
++        {
++            return Ok(());
++        }
++        let run = self.quiet_loop_run.take().expect("matching loop run");
++        self.transcript_cells.remove(run.start);
++        let Some(summary) = summary else {
++            return Ok(());
++        };
++        if self.transcript_cells.len().saturating_sub(run.start) > 64 {
++            return Ok(());
++        }
++        let Some(cell) = history_cell::QuietLoopCell::bounded(
++            summary,
++            self.transcript_cells[run.start..].to_vec(),
++            run.expected_users,
++        ) else {
++            return Ok(());
++        };
++        self.transcript_cells
++            .splice(run.start.., [Arc::new(cell) as Arc<dyn HistoryCell>]);
++        if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
++            overlay.replace_cells(self.transcript_cells.clone());
++        }
++        self.finish_required_stream_reflow(tui)
++    }
++}
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 98e03ab10b..36ed5bfb21 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -707,6 +707,7 @@
+             /*initial_user_message*/ None,
+         );
+         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
++        self.chat_widget.loop_tool_available = app_server.loop_tools_available(thread_id);
+         self.chat_widget
+             .set_task_mentions_enabled(app_server.task_tools_available(thread_id));
+         self.chat_widget
+@@ -815,6 +816,10 @@
+         match result {
+             Ok(started) => {
+                 let thread_id = started.session.thread_id;
++                self.chat_widget.loop_tool_available = started.loop_tool_available;
++                if started.loop_tool_available {
++                    app_server.remember_loop_tool_thread(thread_id);
++                }
+                 if started.task_tools_available {
+                     app_server.remember_task_tool_thread(thread_id);
+                     self.chat_widget.set_task_mentions_enabled(/*enabled*/ true);
+@@ -1030,6 +1035,7 @@
+             initial_user_message,
+         );
+         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
++        self.chat_widget.loop_tool_available = started.loop_tool_available;
+         self.chat_widget
+             .set_task_mentions_enabled(started.task_tools_available);
+         self.chat_widget
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index 4ce96b87f7..6007f06696 100644
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -697,6 +697,7 @@
+             keymap: runtime_keymap,
+             key_chord_matcher: KeyChordMatcher::default(),
+             transcript_cells: Vec::new(),
++            quiet_loop_run: None,
+             last_rendered_history_tail: None,
+             last_thread_usage_status_cell: None,
+             pending_thread_usage_history_refresh: false,
+@@ -792,6 +793,10 @@
+         let initial_session_started_at = Instant::now();
+         if let Some(started) = initial_started_thread {
+             let thread_id = started.session.thread_id;
++            app.chat_widget.loop_tool_available = started.loop_tool_available;
++            if started.loop_tool_available {
++                app_server.remember_loop_tool_thread(thread_id);
++            }
+             app.chat_widget
+                 .set_task_mentions_enabled(started.task_tools_available);
+             if started.blocks_direct_input {
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index 2748a624b7..cabbe28f6e 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -37,6 +37,7 @@
+         pending_server_profiles: HashMap::new(),
+         file_search,
+         transcript_cells: Vec::new(),
++        quiet_loop_run: None,
+         last_rendered_history_tail: None,
+         last_thread_usage_status_cell: None,
+         pending_thread_usage_history_refresh: false,
+diff --git a/codex-rs/tui/src/app/tests/buffered_replay.rs b/codex-rs/tui/src/app/tests/buffered_replay.rs
+index ee2bd6c48f..d1d1f69b0c 100644
+--- a/codex-rs/tui/src/app/tests/buffered_replay.rs
++++ b/codex-rs/tui/src/app/tests/buffered_replay.rs
+@@ -103,6 +103,7 @@
+                     turns: vec![turn],
+                     blocks_direct_input: false,
+                     task_tools_available: false,
++                    loop_tool_available: false,
+                 },
+                 &mut snapshot,
+             )
+diff --git a/codex-rs/tui/src/app/tests/prompt_loop_tests.rs b/codex-rs/tui/src/app/tests/prompt_loop_tests.rs
+new file mode 100644
+index 0000000000..ec90074fe1
+--- /dev/null
++++ b/codex-rs/tui/src/app/tests/prompt_loop_tests.rs
+@@ -0,0 +1,114 @@
++use super::*;
++use codex_app_server_client::AppServerEvent;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn embedded_prompt_loop_tool_schedules_and_stops_without_task_mcp() -> Result<()> {
++    Box::pin(async {
++        let (mut app, mut rx, mut op_rx) = make_test_app_with_channels().await;
++        let mut server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
++        // Use a persisted conversation: new empty threads have no rollout to resume yet.
++        let old_thread_id = legacy_loop_rollout(app.chat_widget.config_ref(), Vec::new())?;
++        let config = app.chat_widget.config_ref().clone();
++        let local_settings = crate::local_settings::LocalSettings::from(&config);
++        let started = server.resume_thread(&local_settings, config, old_thread_id, crate::app_server_session::ResumeModelSettings::PreserveExistingThread).await?;
++        assert!(started.loop_tool_available);
++        assert_eq!(started.session.thread_id, old_thread_id);
++        assert!(server.loop_tools_available(old_thread_id));
++        let thread_id = started.session.thread_id;
++        app.chat_widget.loop_tool_available = started.loop_tool_available;
++        app.enqueue_primary_thread_session(started.session, started.turns).await?;
++        app.chat_widget.insert_str("/loop check CI");
++        app.chat_widget.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        app.chat_widget.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        app.chat_widget.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        app.chat_widget.tick_prompt_loop(Instant::now());
++        let text = loop {
++            if let Op::UserTurn { items, .. } = op_rx.try_recv()? {
++                let codex_app_server_protocol::UserInput::Text { text, .. } = &items[0] else { panic!("expected prompt"); };
++                break text.clone();
++            }
++        };
++        let loop_id = text.split("loopId: ").nth(/*n*/ 1).unwrap().split(')').next().unwrap().to_string();
++        for (request_number, arguments, expected_success) in [
++            (1, serde_json::json!({"action":"schedule", "loopId":"stale", "delaySeconds":120, "reason":"CI"}), false),
++            (2, serde_json::json!({"action":"schedule", "loopId":loop_id, "delaySeconds":120, "reason":"CI"}), true),
++            (3, serde_json::json!({"action":"stop", "loopId":loop_id}), true),
++            (4, serde_json::json!({"action":"stop", "loopId":loop_id}), false),
++        ] {
++            while rx.try_recv().is_ok() {}
++            app.handle_app_server_event(&server, AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
++                request_id: AppServerRequestId::Integer(request_number),
++                params: codex_app_server_protocol::DynamicToolCallParams {
++                    thread_id: thread_id.to_string(), turn_id: "turn-loop".to_string(), call_id: format!("loop-{request_number}"),
++                    namespace: None, tool: crate::prompt_loop_tool::TOOL_NAME.to_string(), arguments,
++                },
++            }))).await;
++            let response = loop {
++                if let AppEvent::DynamicToolCallCompleted { response, .. } = rx.try_recv()? { break response; }
++            };
++            assert_eq!(response.success, expected_success);
++        }
++        Ok(())
++    }).await
++}
++
++#[tokio::test]
++async fn capped_legacy_tools_do_not_prevent_tui_resume_or_fork() -> Result<()> {
++    Box::pin(async {
++        let app = make_test_app().await;
++        let mut server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
++        let tools = (0..64).map(|index| codex_app_server_protocol::DynamicToolSpec::Function(
++            codex_app_server_protocol::DynamicToolFunctionSpec {
++                name: format!("legacy_tool_{index}"), description: "Legacy client tool".to_string(),
++                input_schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
++                defer_loading: false,
++            },
++        )).collect();
++        let thread_id = legacy_loop_rollout(app.chat_widget.config_ref(), tools)?;
++        let config = app.chat_widget.config_ref().clone();
++        let local_settings = crate::local_settings::LocalSettings::from(&config);
++        // A previous connection's remembered capability must not survive a rejected registration.
++        server.remember_loop_tool_thread(thread_id);
++        let resumed = server.resume_thread(&local_settings, config.clone(), thread_id, crate::app_server_session::ResumeModelSettings::PreserveExistingThread).await?;
++        assert_eq!(resumed.session.thread_id, thread_id);
++        assert!(!resumed.loop_tool_available);
++        assert!(!server.loop_tools_available(thread_id));
++        let fork = server.fork_thread(&local_settings, config, thread_id).await?;
++        assert_ne!(fork.session.thread_id, thread_id);
++        assert!(!fork.loop_tool_available);
++        assert!(!server.loop_tools_available(fork.session.thread_id));
++        Ok(())
++    }).await
++}
++
++fn legacy_loop_rollout(
++    config: &Config,
++    tools: Vec<codex_app_server_protocol::DynamicToolSpec>,
++) -> Result<ThreadId> {
++    let timestamp = "2026-11-01T00-00-00";
++    let id = app_test_support::create_fake_rollout(
++        config.codex_home.as_path(),
++        timestamp,
++        "2026-11-01T00:00:00Z",
++        "Original conversation context",
++        /*model_provider*/ None,
++        /*git_info*/ None,
++    )
++    .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
++    let path = app_test_support::rollout_path(config.codex_home.as_path(), timestamp, &id);
++    let mut lines = std::fs::read_to_string(&path)?
++        .lines()
++        .map(serde_json::from_str::<serde_json::Value>)
++        .collect::<std::result::Result<Vec<_>, _>>()?;
++    lines[0]["payload"]["dynamic_tools"] = serde_json::to_value(tools)?;
++    lines[0]["payload"]["cwd"] = serde_json::to_value(&config.cwd)?;
++    let contents = lines
++        .iter()
++        .map(serde_json::to_string)
++        .collect::<std::result::Result<Vec<_>, _>>()?
++        .join("\n")
++        + "\n";
++    std::fs::write(path, contents)?;
++    Ok(ThreadId::from_string(&id)?)
++}
+diff --git a/codex-rs/tui/src/app/tests/quiet_loop_tests.rs b/codex-rs/tui/src/app/tests/quiet_loop_tests.rs
+new file mode 100644
+index 0000000000..22c6cfba3b
+--- /dev/null
++++ b/codex-rs/tui/src/app/tests/quiet_loop_tests.rs
+@@ -0,0 +1,64 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn quiet_loop_collapse_rebuilds_only_matching_turn_and_preserves_expanded_transcript()
++-> Result<()> {
++    let (mut app, _events, _ops) = make_test_app_with_channels().await;
++    let thread_id = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(thread_id, test_path_buf("/tmp")),
++        Vec::new(),
++    )
++    .await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    for mode in ["quiet", "nonquiet", "wrong-run", "wrong-thread", "shifted"] {
++        app.transcript_cells = vec![plain_line_cell("Previous conversation")];
++        app.begin_quiet_loop(thread_id, "run".into(), /*expected_users*/ 0);
++        app.transcript_cells
++            .extend([plain_line_cell("Checked CI"), plain_line_cell("Unchanged")]);
++        if mode == "shifted" {
++            app.transcript_cells
++                .insert(0, plain_line_cell("Older page"));
++        }
++        app.finish_quiet_loop(
++            &mut tui,
++            if mode == "wrong-thread" {
++                ThreadId::new()
++            } else {
++                thread_id
++            },
++            if mode == "wrong-run" { "other" } else { "run" }.into(),
++            (mode != "nonquiet").then(|| "Next loop in 5m · unchanged".to_string()),
++        )?;
++        let expected = match mode {
++            "quiet" => 2,
++            "nonquiet" => 3,
++            "shifted" => 5,
++            _ => 4,
++        };
++        assert_eq!(app.transcript_cells.len(), expected);
++        assert_eq!(
++            app.transcript_cells[usize::from(mode == "shifted")].raw_lines(),
++            vec![Line::from("Previous conversation")]
++        );
++        if mode == "quiet" {
++            assert_eq!(app.transcript_cells[1].display_lines(/*width*/ 80).len(), 1);
++            assert_eq!(
++                app.transcript_cells[1].transcript_lines(/*width*/ 80),
++                vec![Line::from("Checked CI"), Line::from("Unchanged")]
++            );
++            // Resize/reflow projection stays collapsed, with original children retained.
++            let rendered = app.render_transcript_lines_for_reflow(/*width*/ 30);
++            let visible = rendered
++                .lines
++                .iter()
++                .map(|line| line.line.to_string())
++                .collect::<Vec<_>>()
++                .join("\n");
++            assert!(visible.contains("Next loop in 5m"));
++            assert!(!visible.contains("Checked CI"));
++        }
++    }
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+index f8d053236d..1ca516b12d 100644
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -989,7 +989,10 @@
+     let starts = recorded_params(&requests, "thread/start");
+     assert_eq!(starts.len(), 2);
+     for params in &starts {
+-        assert_eq!(params["dynamicTools"], serde_json::Value::Null);
++        assert_eq!(
++            params["dynamicTools"],
++            serde_json::to_value(vec![crate::prompt_loop_tool::tool_spec()])?
++        );
+         assert_eq!(params["config"]["web_search"], "live");
+         let server = &params["config"]["mcp_servers.codex_tui"];
+         assert!(
+@@ -1275,7 +1278,10 @@
+             .pop()
+             .expect("fallback task start");
+         if scenario == "allowed" {
+-            assert!(start["dynamicTools"].is_null());
++            assert_eq!(
++                start["dynamicTools"],
++                serde_json::to_value(vec![crate::prompt_loop_tool::tool_spec()])?
++            );
+             assert!(start["config"]["mcp_servers.codex_tui"].is_object());
+         } else {
+             assert_eq!(
+diff --git a/codex-rs/tui/src/app/tests/startup.rs b/codex-rs/tui/src/app/tests/startup.rs
+index d217135021..52456b9da9 100644
+--- a/codex-rs/tui/src/app/tests/startup.rs
++++ b/codex-rs/tui/src/app/tests/startup.rs
+@@ -814,6 +814,7 @@
+                 turns: Vec::new(),
+                 blocks_direct_input: false,
+                 task_tools_available: false,
++                loop_tool_available: false,
+             }),
+         },
+     ))
+@@ -1034,6 +1035,7 @@
+             turns: Vec::new(),
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         }),
+     )
+     .await
+@@ -1072,6 +1074,7 @@
+             turns: Vec::new(),
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         }),
+     )
+     .await
+@@ -1233,6 +1236,7 @@
+             turns: Vec::new(),
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         }),
+     )
+     .await
+@@ -1282,6 +1286,7 @@
+             turns: Vec::new(),
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         }),
+     )
+     .await?;
+@@ -1424,6 +1429,7 @@
+                     turns: Vec::new(),
+                     blocks_direct_input: false,
+                     task_tools_available: false,
++                    loop_tool_available: false,
+                 }),
+             )
+             .await?;
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 1cb3cf299f..5a4f6ac42a 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -2,6 +2,10 @@
+ 
+ #[path = "tests/daybreak_tests.rs"]
+ mod daybreak_tests;
++#[path = "tests/prompt_loop_tests.rs"]
++mod prompt_loop_tests;
++#[path = "tests/quiet_loop_tests.rs"]
++mod quiet_loop_tests;
+ 
+ #[path = "tests/advanced_reasoning_tests.rs"]
+ mod advanced_reasoning_tests;
+@@ -5236,6 +5240,7 @@
+             turns: Vec::new(),
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         },
+         &mut child_snapshot,
+     )
+@@ -5879,6 +5884,7 @@
+         runtime_permission_profile_override: None,
+         file_search,
+         transcript_cells: Vec::new(),
++        quiet_loop_run: None,
+         last_rendered_history_tail: None,
+         last_thread_usage_status_cell: None,
+         pending_thread_usage_history_refresh: false,
+@@ -5978,6 +5984,7 @@
+             runtime_permission_profile_override: None,
+             file_search,
+             transcript_cells: Vec::new(),
++            quiet_loop_run: None,
+             last_rendered_history_tail: None,
+             last_thread_usage_status_cell: None,
+             pending_thread_usage_history_refresh: false,
+@@ -6336,6 +6343,7 @@
+             )],
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         },
+         session_lifecycle::ThreadAttachPresentation::SessionLineage,
+         /*initial_user_message*/ None,
+@@ -8483,6 +8491,7 @@
+             turns: resumed_turns.clone(),
+             blocks_direct_input: true,
+             task_tools_available: false,
++            loop_tool_available: false,
+         },
+         &mut snapshot,
+     )
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 4e4f534ca6..11a0fc9679 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -235,6 +235,7 @@
+ mod pets;
+ mod platform_actions;
+ mod plugin_mentions;
++mod quiet_loop;
+ mod rate_limit_refresh;
+ mod realtime_delivery;
+ mod reasoning_replay;
+@@ -575,6 +576,7 @@
+     pub(crate) file_search: FileSearchManager,
+ 
+     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
++    quiet_loop_run: Option<quiet_loop::QuietLoopRun>,
+     last_rendered_history_tail: Option<history_ui::RenderedHistoryTail>,
+     last_thread_usage_status_cell: Option<history_ui::ThreadUsageStatusHistory>,
+     pub(crate) pending_thread_usage_history_refresh: bool,
+@@ -961,6 +963,9 @@
+                     }
+                     // Allow widgets to process any pending timers before rendering.
+                     let had_active_view = self.chat_widget.has_active_view();
++                    if !self.reconnect.offline {
++                        self.chat_widget.tick_prompt_loop(Instant::now());
++                    }
+                     self.chat_widget.pre_draw_tick();
+                     let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
+                     if !had_active_view
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 7611d89cf5..e0e7c18711 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -1056,6 +1056,16 @@
+     BeginThreadSwitchHistoryReplayBuffer,
+ 
+     InsertHistoryCell(Box<dyn HistoryCell>),
++    BeginQuietLoop {
++        thread_id: ThreadId,
++        run_id: String,
++        expected_users: usize,
++    },
++    FinishQuietLoop {
++        thread_id: ThreadId,
++        run_id: String,
++        summary: Option<String>,
++    },
+ 
+     /// Finish buffering initial resume replay after all replay events have been queued.
+     EndInitialHistoryReplayBuffer,
+diff --git a/codex-rs/tui/src/app_server_session/loop_registration.rs b/codex-rs/tui/src/app_server_session/loop_registration.rs
+new file mode 100644
+index 0000000000..5764d59065
+--- /dev/null
++++ b/codex-rs/tui/src/app_server_session/loop_registration.rs
+@@ -0,0 +1,17 @@
++//! Registration is optional: only an explicit server marker permits a plain attach retry.
++use super::JSONRPC_INVALID_PARAMS;
++use super::JSONRPC_INVALID_REQUEST;
++use codex_app_server_protocol::JSONRPCErrorError;
++
++pub(super) fn is_loop_registration_rejected(error: &JSONRPCErrorError) -> bool {
++    matches!(error.code, JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS)
++        && error
++            .data
++            .as_ref()
++            .and_then(|data| data.get("dynamicToolRegistrationRejected"))
++            == Some(&serde_json::Value::Bool(true))
++}
++
++#[cfg(test)]
++#[path = "loop_registration_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/app_server_session/loop_registration_tests.rs b/codex-rs/tui/src/app_server_session/loop_registration_tests.rs
+new file mode 100644
+index 0000000000..30d8f75f53
+--- /dev/null
++++ b/codex-rs/tui/src/app_server_session/loop_registration_tests.rs
+@@ -0,0 +1,44 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++#[test]
++fn only_explicit_registration_rejections_allow_plain_attach_retry() {
++    for (code, data, expected) in [
++        (
++            JSONRPC_INVALID_REQUEST,
++            Some(json!({"dynamicToolRegistrationRejected":true})),
++            true,
++        ),
++        (
++            JSONRPC_INVALID_PARAMS,
++            Some(json!({"dynamicToolRegistrationRejected":true})),
++            true,
++        ),
++        (JSONRPC_INVALID_REQUEST, None, false),
++        (
++            JSONRPC_INVALID_REQUEST,
++            Some(json!({"dynamicToolRegistrationRejected":false})),
++            false,
++        ),
++        (
++            JSONRPC_INVALID_REQUEST,
++            Some(json!({"dynamicToolRegistrationRejected":"true"})),
++            false,
++        ),
++        (
++            -32603,
++            Some(json!({"dynamicToolRegistrationRejected":true})),
++            false,
++        ),
++    ] {
++        assert_eq!(
++            is_loop_registration_rejected(&JSONRPCErrorError {
++                code,
++                data,
++                message: "unrelated text must not control retry behavior".to_string(),
++            }),
++            expected
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/app_server_session/rollout_history.rs b/codex-rs/tui/src/app_server_session/rollout_history.rs
+index 4d0d411b7b..e0af824337 100644
+--- a/codex-rs/tui/src/app_server_session/rollout_history.rs
++++ b/codex-rs/tui/src/app_server_session/rollout_history.rs
+@@ -7,6 +7,7 @@
+ use super::ThreadHistorySupport;
+ use super::bootstrap_request_error;
+ use super::is_history_pagination_unsupported;
++use super::is_loop_registration_rejected;
+ use super::started_thread_from_resume_response;
+ use super::thread_resume_params_from_config;
+ use super::thread_session_state_from_thread_response;
+@@ -65,6 +66,7 @@
+             turns: thread.turns,
+             blocks_direct_input: false,
+             task_tools_available: false,
++            loop_tool_available: false,
+         })
+     }
+ 
+@@ -115,6 +117,7 @@
+         );
+         self.thread_tool_transport()
+             .configure_mcp(&mut params.config);
++        params.dynamic_tools = Some(vec![crate::prompt_loop_tool::tool_spec()]);
+         let mut rollout_maintenance_guard = None;
+         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
+             let known_legacy_history = self
+@@ -143,37 +146,42 @@
+         if params.exclude_turns {
+             rollout_maintenance_guard = None;
+         }
+-        let request_id = self.next_request_id();
+-        let resume_response = self
+-            .client
+-            .request_typed(ClientRequest::ThreadResume {
+-                request_id,
+-                params: params.clone(),
+-            })
+-            .await;
++        let mut response: ThreadResumeResponse = loop {
++            let request_id = self.next_request_id();
++            match self
++                .client
++                .request_typed(ClientRequest::ThreadResume {
++                    request_id,
++                    params: params.clone(),
++                })
++                .await
++            {
++                Ok(response) => break response,
++                Err(TypedRequestError::Server { source, .. })
++                    if params.dynamic_tools.is_some() && is_loop_registration_rejected(&source) =>
++                {
++                    params.dynamic_tools = None;
++                    tracing::warn!(
++                        "loop registration rejected; retrying resume without the optional tool"
++                    );
++                }
++                Err(TypedRequestError::Server { source, .. })
++                    if params.exclude_turns && is_history_pagination_unsupported(&source) =>
++                {
++                    self.history_support = ThreadHistorySupport::LegacyOnly;
++                    params.exclude_turns = false;
++                }
++                Err(error) => {
++                    return Err(bootstrap_request_error(
++                        "thread/resume failed during TUI bootstrap",
++                        error,
++                    ));
++                }
++            }
++        };
+         drop(rollout_maintenance_guard);
+-        let mut response: ThreadResumeResponse = match resume_response {
+-            Ok(response) => response,
+-            Err(TypedRequestError::Server { source, .. })
+-                if params.exclude_turns && is_history_pagination_unsupported(&source) =>
+-            {
+-                self.history_support = ThreadHistorySupport::LegacyOnly;
+-                params.exclude_turns = false;
+-                let request_id = self.next_request_id();
+-                self.client
+-                    .request_typed(ClientRequest::ThreadResume { request_id, params })
+-                    .await
+-                    .map_err(|err| {
+-                        bootstrap_request_error("thread/resume failed during TUI bootstrap", err)
+-                    })?
+-            }
+-            Err(err) => {
+-                return Err(bootstrap_request_error(
+-                    "thread/resume failed during TUI bootstrap",
+-                    err,
+-                ));
+-            }
+-        };
++        let loop_tools_registered =
++            params.dynamic_tools.is_some() && response.dynamic_tools_registered == Some(true);
+         self.hydrate_initial_thread_history(
+             &mut response.thread,
+             response.turns_backwards_cursor.clone(),
+@@ -194,6 +202,12 @@
+         )
+         .await?;
+         started.session.fork_parent_title = fork_parent_title;
++        started.loop_tool_available = loop_tools_registered;
++        if loop_tools_registered {
++            self.remember_loop_tool_thread(thread_id);
++        } else {
++            self.loop_tool_threads.remove(&thread_id);
++        }
+         if self.task_tools_available(thread_id) {
+             self.remember_task_tool_thread(thread_id);
+             started.task_tools_available = true;
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 1d25109f72..b29eedc8a5 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -5,9 +5,11 @@
+ 
+ mod fs;
+ mod history;
++mod loop_registration;
+ mod models;
+ mod realtime;
+ mod rollout_history;
++use loop_registration::is_loop_registration_rejected;
+ mod thread_list;
+ 
+ #[cfg(test)]
+@@ -227,7 +229,8 @@
+     request_handle: &AppServerRequestHandle,
+     mut request_id: RequestId,
+     mut params: ThreadStartParams,
+-) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool), TypedRequestError> {
++) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool, bool), TypedRequestError>
++{
+     let mut history_support = ThreadHistorySupport::Paginated;
+     loop {
+         match request_handle
+@@ -238,12 +241,28 @@
+             .await
+         {
+             Ok(response) => {
+-                let task_tools_available = params.dynamic_tools.is_some()
+-                    || params
+-                        .config
+-                        .as_ref()
+-                        .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
+-                return Ok((response, history_support, task_tools_available));
++                let dynamic_tools = params.dynamic_tools.as_deref().unwrap_or_default();
++                let task_tools_available = dynamic_tools.iter().any(|tool| match tool {
++                    codex_app_server_protocol::DynamicToolSpec::Function(function) => {
++                        function.name != crate::prompt_loop_tool::TOOL_NAME
++                    }
++                    codex_app_server_protocol::DynamicToolSpec::Namespace(_) => true,
++                }) || params
++                    .config
++                    .as_ref()
++                    .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
++                let loop_tool_available = dynamic_tools.iter().any(|tool| match tool {
++                    codex_app_server_protocol::DynamicToolSpec::Function(function) => {
++                        function.name == crate::prompt_loop_tool::TOOL_NAME
++                    }
++                    codex_app_server_protocol::DynamicToolSpec::Namespace(_) => false,
++                });
++                return Ok((
++                    response,
++                    history_support,
++                    task_tools_available,
++                    loop_tool_available,
++                ));
+             }
+             Err(TypedRequestError::Server { source, .. })
+                 if params.history_mode.is_some() && is_history_pagination_unsupported(&source) =>
+@@ -311,6 +330,7 @@
+     next_request_id: i64,
+     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
+     task_tool_threads: HashSet<ThreadId>,
++    loop_tool_threads: HashSet<ThreadId>,
+     task_tool_capabilities_dir: Option<AbsolutePathBuf>,
+     task_search_generation: Arc<AtomicU64>,
+     remote_cwd_override: Option<PathBuf>,
+@@ -356,6 +376,7 @@
+     pub(crate) turns: Vec<Turn>,
+     pub(crate) blocks_direct_input: bool,
+     pub(crate) task_tools_available: bool,
++    pub(crate) loop_tool_available: bool,
+ }
+ 
+ pub(crate) fn is_active_writer_error(err: &color_eyre::eyre::Report) -> bool {
+@@ -412,6 +433,7 @@
+             next_request_id: 1,
+             history_pagination: HashMap::new(),
+             task_tool_threads: HashSet::new(),
++            loop_tool_threads: HashSet::new(),
+             task_tool_capabilities_dir: None,
+             task_search_generation: Arc::new(AtomicU64::new(0)),
+             remote_cwd_override: None,
+@@ -518,6 +540,15 @@
+     /// Carry capabilities that may exist only in memory when the optional cache is unwritable.
+     pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
+         self.task_tool_threads.extend(&previous.task_tool_threads);
++        self.loop_tool_threads.extend(&previous.loop_tool_threads);
++    }
++
++    pub(crate) fn loop_tools_available(&self, thread_id: ThreadId) -> bool {
++        self.loop_tool_threads.contains(&thread_id)
++    }
++
++    pub(crate) fn remember_loop_tool_thread(&mut self, thread_id: ThreadId) {
++        self.loop_tool_threads.insert(thread_id);
+     }
+ 
+     pub(crate) fn task_tools_available(&self, thread_id: ThreadId) -> bool {
+@@ -826,7 +857,7 @@
+         }
+         self.thread_tool_transport().configure(&mut params);
+         let request_handle = self.request_handle();
+-        let (response, history_support, task_tools_available) =
++        let (response, history_support, task_tools_available, loop_tool_available) =
+             request_thread_start_with_history_fallback(&request_handle, request_id, params)
+                 .await
+                 .map_err(|err| {
+@@ -843,6 +874,10 @@
+         )
+         .await?;
+         started.task_tools_available = task_tools_available;
++        started.loop_tool_available = loop_tool_available;
++        if loop_tool_available {
++            self.remember_loop_tool_thread(started.session.thread_id);
++        }
+         if task_tools_available {
+             self.remember_task_tool_thread(started.session.thread_id);
+         }
+@@ -962,7 +997,6 @@
+                 .as_ref()
+                 .is_some_and(|thread| thread.history_mode == ThreadHistoryMode::Paginated)
+                 || presentation == ForkPresentation::SideConversation);
+-        let request_id = self.next_request_id();
+         let session_config = if config.model.is_none() {
+             // Avoid inferring a tier from the stale client default model.
+             config.clone()
+@@ -999,36 +1033,43 @@
+         }
+         self.thread_tool_transport()
+             .configure_mcp(&mut params.config);
+-        let response: ThreadForkResponse = match self
+-            .client
+-            .request_typed(ClientRequest::ThreadFork {
+-                request_id,
+-                params: params.clone(),
+-            })
+-            .await
+-        {
+-            Ok(response) => response,
+-            Err(TypedRequestError::Server { source, .. })
+-                if params.exclude_turns && is_history_pagination_unsupported(&source) =>
++        params.dynamic_tools = Some(vec![crate::prompt_loop_tool::tool_spec()]);
++        let response: ThreadForkResponse = loop {
++            let request_id = self.next_request_id();
++            match self
++                .client
++                .request_typed(ClientRequest::ThreadFork {
++                    request_id,
++                    params: params.clone(),
++                })
++                .await
+             {
+-                self.history_support = ThreadHistorySupport::LegacyOnly;
+-                params.exclude_turns = false;
+-                let request_id = self.next_request_id();
+-                self.client
+-                    .request_typed(ClientRequest::ThreadFork { request_id, params })
+-                    .await
+-                    .map_err(|err| {
+-                        bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
+-                    })?
+-            }
+-            Err(err) => {
+-                return Err(bootstrap_request_error(
+-                    "thread/fork failed during TUI bootstrap",
+-                    err,
+-                ));
++                Ok(response) => break response,
++                Err(TypedRequestError::Server { source, .. })
++                    if params.dynamic_tools.is_some() && is_loop_registration_rejected(&source) =>
++                {
++                    params.dynamic_tools = None;
++                    tracing::warn!(
++                        "loop registration rejected; retrying fork without the optional tool"
++                    );
++                }
++                Err(TypedRequestError::Server { source, .. })
++                    if params.exclude_turns && is_history_pagination_unsupported(&source) =>
++                {
++                    self.history_support = ThreadHistorySupport::LegacyOnly;
++                    params.exclude_turns = false;
++                }
++                Err(error) => {
++                    return Err(bootstrap_request_error(
++                        "thread/fork failed during TUI bootstrap",
++                        error,
++                    ));
++                }
+             }
+         };
+         let mut response = response;
++        let loop_tools_registered =
++            params.dynamic_tools.is_some() && response.dynamic_tools_registered == Some(true);
+         if presentation == ForkPresentation::Regular
+             && !response.thread.ephemeral
+             && let Err(error) = self
+@@ -1056,6 +1097,10 @@
+         )
+         .await?;
+         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
++        started.loop_tool_available = loop_tools_registered;
++        if loop_tools_registered {
++            self.remember_loop_tool_thread(started.session.thread_id);
++        }
+         if self.task_tools_available(thread_id) {
+             started.task_tools_available = true;
+             self.remember_task_tool_thread(started.session.thread_id);
+@@ -1720,7 +1765,7 @@
+         /*session_start_source*/ None,
+     );
+     thread_tool_transport.configure(&mut params);
+-    let (response, _history_support, task_tools_available) =
++    let (response, _history_support, task_tools_available, loop_tool_available) =
+         request_thread_start_with_history_fallback(&request_handle, request_id, params)
+             .await
+             .map_err(|err| {
+@@ -1730,6 +1775,7 @@
+         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
+             .await?;
+     started.task_tools_available = task_tools_available;
++    started.loop_tool_available = loop_tool_available;
+     Ok(started)
+ }
+ 
+@@ -2232,6 +2278,7 @@
+         turns: response.thread.turns,
+         blocks_direct_input,
+         task_tools_available: false,
++        loop_tool_available: false,
+     })
+ }
+ 
+@@ -2255,6 +2302,7 @@
+         turns: response.thread.turns,
+         blocks_direct_input,
+         task_tools_available: false,
++        loop_tool_available: false,
+     })
+ }
+ 
+@@ -2278,6 +2326,7 @@
+         turns: response.thread.turns,
+         blocks_direct_input,
+         task_tools_available: false,
++        loop_tool_available: false,
+     })
+ }
+ 
+@@ -3875,6 +3924,7 @@
+         let forked_from_id = ThreadId::new();
+         let read_only_profile = PermissionProfile::read_only();
+         let response = ThreadResumeResponse {
++            dynamic_tools_registered: None,
+             thread: codex_app_server_protocol::Thread {
+                 originator: None,
+                 environments: None,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index e0be308b80..0ba96ea9fb 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -132,6 +132,9 @@
+             session_telemetry,
+             session_header: SessionHeader::new(header_model),
+             initial_user_message,
++            prompt_loop: None,
++            quiet_loop_run: None,
++            loop_tool_available: false,
+             status_account_display,
+             remote_connection: None,
+             local_worktree_operations: true,
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index fdfe3f6ab6..fe00c2f4d5 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -34,6 +34,7 @@
+     }
+ 
+     fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
++        self.invalidate_quiet_loop();
+         let cmd = command.trim();
+         if cmd.is_empty() {
+             self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+@@ -369,6 +370,7 @@
+             None
+         };
+         let client_user_message_id = uuid::Uuid::new_v4().to_string();
++        self.note_loop_submission(&client_user_message_id);
+         let pending_steer = (!render_in_history).then(|| PendingSteer {
+             client_id: client_user_message_id.clone(),
+             user_message: UserMessage {
+diff --git a/codex-rs/tui/src/chatwidget/prompt_loop.rs b/codex-rs/tui/src/chatwidget/prompt_loop.rs
+new file mode 100644
+index 0000000000..a63d9c732d
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/prompt_loop.rs
+@@ -0,0 +1,342 @@
++//! Session-local recurring prompts; never steer an active turn or overwrite a draft.
++use super::*;
++
++const LIFETIME: Duration = Duration::from_secs(/*secs*/ 7 * 24 * 60 * 60);
++const MAX_PROMPT_BYTES: usize = 2_000;
++const USAGE: &str =
++    "Usage: /loop [interval] <prompt> | /loop status | /loop stop (interval: 1m–7d)";
++
++#[derive(Clone, Copy)]
++pub(super) enum Cadence {
++    Fixed(Duration),
++    SelfPaced,
++}
++
++pub(super) struct PromptLoop {
++    thread_id: ThreadId,
++    prompt: String,
++    id: String,
++    cadence: Cadence,
++    due_at: Option<Instant>,
++    expires_at: Instant,
++    showed_prompt: bool,
++}
++
++fn parse_interval(value: &str) -> Option<Duration> {
++    let (number, unit) = value.split_at_checked(value.len().checked_sub(/*rhs*/ 1)?)?;
++    let multiplier = match unit {
++        "s" => 1,
++        "m" => 60,
++        "h" => 3_600,
++        "d" => 86_400,
++        _ => return None,
++    };
++    let seconds = number.parse::<u64>().ok()?.checked_mul(multiplier)?;
++    (60..=LIFETIME.as_secs())
++        .contains(&seconds)
++        .then(|| Duration::from_secs(seconds))
++}
++
++fn format_loop_duration(seconds: u64) -> String {
++    if seconds == 0 {
++        return "0s".to_string();
++    }
++    [
++        (seconds / 86_400, "d"),
++        ((seconds / 3_600) % 24, "h"),
++        ((seconds / 60) % 60, "m"),
++        (seconds % 60, "s"),
++    ]
++    .into_iter()
++    .filter(|(value, _)| *value != 0)
++    .map(|(value, unit)| format!("{value}{unit}"))
++    .collect::<Vec<_>>()
++    .join(" ")
++}
++
++impl ChatWidget {
++    pub(super) fn handle_prompt_loop_command(&mut self, args: &str) {
++        match args.trim() {
++            "stop" | "cancel" => {
++                self.prompt_loop = None;
++                self.add_info_message("Loop stopped.".to_string(), /*hint*/ None);
++                return;
++            }
++            "" | "status" => {
++                let message = match &self.prompt_loop {
++                    Some(state) => format!(
++                        "Loop: {} · {} · {}",
++                        match state.cadence {
++                            Cadence::Fixed(interval) =>
++                                format!("every {}", format_loop_duration(interval.as_secs())),
++                            Cadence::SelfPaced => "self-paced".to_string(),
++                        },
++                        match state.due_at {
++                            Some(due) => format!(
++                                "next in {}",
++                                format_loop_duration(
++                                    due.saturating_duration_since(Instant::now()).as_secs()
++                                )
++                            ),
++                            None => "awaiting next schedule".to_string(),
++                        },
++                        state.prompt
++                    ),
++                    None => "No active loop.".to_string(),
++                };
++                self.add_info_message(message, /*hint*/ None);
++                return;
++            }
++            _ => {}
++        }
++        let (first, rest) = args
++            .trim()
++            .split_once(char::is_whitespace)
++            .unwrap_or((args.trim(), ""));
++        let (cadence, prompt) = match parse_interval(first) {
++            Some(interval) => (Cadence::Fixed(interval), rest),
++            None if first.starts_with(|c: char| c.is_ascii_digit()) => {
++                self.add_error_message(USAGE.to_string());
++                return;
++            }
++            None => (Cadence::SelfPaced, args.trim()),
++        };
++        if matches!(cadence, Cadence::SelfPaced) && !self.loop_tool_available {
++            self.add_error_message("The scheduling tool is unavailable for this conversation. Specify a fixed interval for /loop.".to_string());
++            return;
++        }
++        let prompt = prompt.trim();
++        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
++            self.add_error_message(format!(
++                "Loop prompt must contain 1–{MAX_PROMPT_BYTES} UTF-8 bytes."
++            ));
++            return;
++        }
++        let Some(thread_id) = self.thread_id else {
++            self.add_error_message(
++                "Session is still starting; try /loop again in a moment.".to_string(),
++            );
++            return;
++        };
++        let now = Instant::now();
++        let cadence_label = match cadence {
++            Cadence::Fixed(interval) => {
++                format!("every {}", format_loop_duration(interval.as_secs()))
++            }
++            Cadence::SelfPaced => "self-paced".to_string(),
++        };
++        self.prompt_loop = Some(PromptLoop {
++            thread_id,
++            prompt: prompt.to_string(),
++            id: uuid::Uuid::new_v4().to_string(),
++            cadence,
++            due_at: Some(now),
++            expires_at: now + LIFETIME,
++            showed_prompt: false,
++        });
++        self.add_info_message(
++            format!("Loop started · {cadence_label} · expires in 7d"),
++            /*hint*/ None,
++        );
++        self.frame_requester.schedule_frame();
++    }
++
++    pub(crate) fn apply_prompt_loop_action(
++        &mut self,
++        thread_id: &str,
++        turn_id: &str,
++        arguments: serde_json::Value,
++    ) -> Result<String, String> {
++        use crate::prompt_loop_tool::LoopAction;
++        if let Some(run) = &mut self.quiet_loop_run {
++            run.summary = None;
++        }
++        let action: LoopAction =
++            serde_json::from_value(arguments).map_err(|error| error.to_string())?;
++        let state = self.prompt_loop.as_mut().ok_or("No active loop.")?;
++        if state.thread_id.to_string() != thread_id
++            || self.thread_id != Some(state.thread_id)
++            || Instant::now() >= state.expires_at
++        {
++            return Err("This loop is unavailable in the calling thread.".to_string());
++        }
++        let loop_id = match &action {
++            LoopAction::Schedule { loop_id, .. }
++            | LoopAction::Report { loop_id, .. }
++            | LoopAction::Stop { loop_id } => loop_id,
++        };
++        if loop_id != &state.id {
++            return Err("The self-paced loop is no longer active.".to_string());
++        }
++        match action {
++            LoopAction::Report { reason, quiet, .. } => {
++                let Cadence::Fixed(interval) = state.cadence else {
++                    return Err("Self-paced loops must schedule the next check.".to_string());
++                };
++                if reason.trim().is_empty()
++                    || reason.len() > 200
++                    || reason.chars().any(char::is_control)
++                {
++                    return Err("Use a single-line reason of 1–200 bytes.".to_string());
++                }
++                let delay = state
++                    .due_at
++                    .map(|due| due.saturating_duration_since(Instant::now()))
++                    .unwrap_or(interval);
++                let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
++                let summary = format!("Next loop in {} · {reason}", format_loop_duration(seconds));
++                self.record_quiet_loop_report(turn_id, summary.clone(), quiet);
++                self.add_info_message(summary, /*hint*/ None);
++                Ok("Check reported; fixed cadence unchanged.".to_string())
++            }
++            LoopAction::Stop { .. } => {
++                self.prompt_loop = None;
++                self.add_info_message("Loop completed.".to_string(), /*hint*/ None);
++                Ok("Loop stopped.".to_string())
++            }
++            LoopAction::Schedule {
++                delay_seconds,
++                reason,
++                quiet,
++                ..
++            } => {
++                if !matches!(state.cadence, Cadence::SelfPaced) {
++                    return Err("Fixed loops use report to preserve their cadence.".to_string());
++                }
++                if !(60..=3600).contains(&delay_seconds)
++                    || reason.trim().is_empty()
++                    || reason.len() > 200
++                    || reason.chars().any(char::is_control)
++                {
++                    return Err(
++                        "Use a delay of 60–3600 seconds and a reason of 1–200 bytes.".to_string(),
++                    );
++                }
++                state.due_at = Some(Instant::now() + Duration::from_secs(delay_seconds));
++                let summary = format!(
++                    "Next loop in {} · {reason}",
++                    format_loop_duration(delay_seconds)
++                );
++                self.record_quiet_loop_report(turn_id, summary.clone(), quiet);
++                self.add_info_message(summary, /*hint*/ None);
++                self.frame_requester
++                    .schedule_frame_in(Duration::from_secs(delay_seconds));
++                Ok("Next run scheduled; end this turn now.".to_string())
++            }
++        }
++    }
++
++    pub(crate) fn tick_prompt_loop(&mut self, now: Instant) {
++        let Some(state) = &self.prompt_loop else {
++            return;
++        };
++        if self.thread_id != Some(state.thread_id) || now >= state.expires_at {
++            self.prompt_loop = None;
++            self.add_info_message("Loop ended.".to_string(), /*hint*/ None);
++            return;
++        }
++        let Some(due_at) = state.due_at else {
++            self.frame_requester
++                .schedule_frame_in(state.expires_at - now);
++            return;
++        };
++        if now < due_at {
++            self.frame_requester
++                .schedule_frame_in(due_at.min(state.expires_at) - now);
++            return;
++        }
++        if self.pending_stream_consolidations > 0
++            || self.is_user_turn_pending_or_running()
++            || self.bottom_pane.is_task_running()
++            || !self.composer_is_empty()
++            || !self.bottom_pane.no_modal_or_popup_active()
++            || self.input_queue.has_queued_follow_up_messages()
++            || self.input_queue.suppress_queue_autosend
++            || self.input_queue.rate_limit_recovery_pending
++            || self.active_side_conversation
++            || self.has_misalignment_policy_violation()
++        {
++            // One retry timer, regardless of how many intervals elapsed while busy.
++            self.frame_requester
++                .schedule_frame_in(Duration::from_secs(/*secs*/ 1));
++            return;
++        }
++        let prompt = match state.cadence {
++            Cadence::Fixed(_) if !self.loop_tool_available => state.prompt.clone(),
++            cadence => format!(
++                "{} /loop (loopId: {}). Run the prompt below in this same conversation. {} Set quiet=true only when nothing meaningful changed; report meaningful changes normally. End this turn after the control call.\n\n{}",
++                if matches!(cadence, Cadence::SelfPaced) {
++                    "Self-paced"
++                } else {
++                    "Fixed"
++                },
++                state.id,
++                if matches!(cadence, Cadence::SelfPaced) {
++                    "Before ending, call schedule_loop to schedule the next check in 60–3600 seconds with a brief reason, or stop when complete."
++                } else {
++                    "Before ending, call schedule_loop action report with a brief reason, or stop when complete; report preserves fixed cadence."
++                },
++                state.prompt
++            ),
++        };
++        let next_due = match state.cadence {
++            Cadence::Fixed(interval) => Some(now + interval),
++            Cadence::SelfPaced => None,
++        };
++        let history_prompt = if state.showed_prompt {
++            String::new()
++        } else {
++            state.prompt.clone()
++        };
++        let thread_id = state.thread_id;
++        let expected_users = usize::from(!state.showed_prompt);
++        let repeated_prompt = state.showed_prompt.then(|| state.prompt.clone());
++        // A prior turn's active tool cell must precede this run's transcript boundary.
++        self.flush_active_cell();
++        let run_id = uuid::Uuid::new_v4().to_string();
++        self.quiet_loop_run = Some(super::quiet_loop::QuietLoopRun {
++            id: run_id.clone(),
++            thread_id,
++            turn_id: None,
++            client_id: None,
++            prompt: prompt.clone(),
++            summary: None,
++            completed: false,
++            valid: true,
++        });
++        self.app_event_tx.send(AppEvent::BeginQuietLoop {
++            thread_id,
++            run_id,
++            expected_users,
++        });
++        let (accepted, _) = self.submit_user_message_with_history_and_shell_escape_policy(
++            prompt.into(),
++            UserMessageHistoryRecord::Override(super::user_messages::UserMessageHistoryOverride {
++                text: history_prompt,
++                text_elements: Vec::new(),
++            }),
++            ShellEscapePolicy::Disallow,
++            UserMessageSource::Prompt,
++        );
++        if accepted && let Some(state) = &mut self.prompt_loop {
++            state.due_at = next_due;
++            state.showed_prompt = true;
++        }
++        if accepted && let Some(prompt) = repeated_prompt {
++            self.add_to_history(history_cell::QuietLoopPromptCell(
++                history_cell::new_user_prompt(prompt, Vec::new(), Vec::new(), Vec::new()),
++            ));
++        }
++        if !accepted {
++            self.quiet_loop_run = None;
++        }
++        if let Some(state) = &self.prompt_loop {
++            self.frame_requester.schedule_frame_in(
++                state
++                    .due_at
++                    .unwrap_or(state.expires_at)
++                    .saturating_duration_since(now),
++            );
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 9ec441ad2e..05f7fb9028 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -66,6 +66,7 @@
+             }
+             ServerNotification::TurnStarted(notification) => {
+                 if replay_kind.is_none() {
++                    self.loop_turn_started(&notification.turn.id);
+                     self.clear_misalignment_for_new_turn(
+                         &notification.turn.id,
+                         MisalignmentTurnSource::ServerNotification,
+@@ -466,6 +467,12 @@
+         if replay_kind.is_none() {
+             self.finish_realtime_turn(&notification.turn.id);
+         }
++        if replay_kind.is_none() {
++            self.complete_quiet_loop(
++                &notification.turn.id,
++                notification.turn.status == TurnStatus::Completed,
++            );
++        }
+         self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/quiet_loop.rs b/codex-rs/tui/src/chatwidget/quiet_loop.rs
+new file mode 100644
+index 0000000000..b74c217826
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/quiet_loop.rs
+@@ -0,0 +1,84 @@
++//! Identity and completion barriers for presentation-only automatic-turn collapse.
++use super::*;
++
++pub(super) struct QuietLoopRun {
++    pub(super) id: String,
++    pub(super) thread_id: ThreadId,
++    pub(super) turn_id: Option<String>,
++    pub(super) client_id: Option<String>,
++    pub(super) prompt: String,
++    pub(super) summary: Option<String>,
++    pub(super) completed: bool,
++    pub(super) valid: bool,
++}
++
++impl ChatWidget {
++    pub(super) fn note_loop_submission(&mut self, client_id: &str) {
++        if let Some(run) = &mut self.quiet_loop_run
++            && run.client_id.is_none()
++        {
++            run.client_id = Some(client_id.to_string());
++        } else {
++            self.invalidate_quiet_loop();
++        }
++    }
++    pub(super) fn loop_turn_started(&mut self, turn_id: &str) {
++        if let Some(run) = &mut self.quiet_loop_run {
++            if run.turn_id.is_none() {
++                run.turn_id = Some(turn_id.to_string());
++            } else if run.turn_id.as_deref() != Some(turn_id) {
++                self.quiet_loop_run = None;
++            }
++        }
++    }
++    pub(super) fn is_loop_echo(&self, client_id: Option<&str>, turn_id: &str, text: &str) -> bool {
++        self.quiet_loop_run.as_ref().is_some_and(|run| {
++            self.thread_id == Some(run.thread_id)
++                && run.turn_id.as_deref() == Some(turn_id)
++                && match client_id {
++                    Some(id) => run.client_id.as_deref() == Some(id),
++                    None => run.prompt == text,
++                }
++        })
++    }
++    pub(super) fn invalidate_quiet_loop(&mut self) {
++        if let Some(run) = &mut self.quiet_loop_run {
++            run.valid = false;
++            run.summary = None;
++        }
++    }
++    pub(super) fn record_quiet_loop_report(&mut self, turn_id: &str, summary: String, quiet: bool) {
++        if let Some(run) = &mut self.quiet_loop_run {
++            run.summary =
++                (quiet && run.valid && run.turn_id.as_deref() == Some(turn_id)).then_some(summary);
++        }
++    }
++    pub(super) fn complete_quiet_loop(&mut self, turn_id: &str, completed: bool) {
++        if self.quiet_loop_run.is_some() {
++            self.flush_active_cell();
++        }
++        if let Some(run) = &mut self.quiet_loop_run {
++            if run.turn_id.as_deref() != Some(turn_id) || !completed || !run.valid {
++                run.summary = None;
++            }
++            run.completed = true;
++        }
++        self.finish_quiet_loop_if_ready();
++    }
++    pub(super) fn finish_quiet_loop_if_ready(&mut self) {
++        if self.pending_stream_consolidations > 0
++            || !self
++                .quiet_loop_run
++                .as_ref()
++                .is_some_and(|run| run.completed)
++        {
++            return;
++        }
++        let run = self.quiet_loop_run.take().expect("completed run");
++        self.app_event_tx.send(AppEvent::FinishQuietLoop {
++            thread_id: run.thread_id,
++            run_id: run.id,
++            summary: if run.valid { run.summary } else { None },
++        });
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index f67ece542e..cd41159763 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -147,6 +147,7 @@
+     }
+ 
+     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
++        self.invalidate_quiet_loop();
+         if cmd != SlashCommand::Copy {
+             self.transcript.last_status_copy_targets = None;
+         }
+@@ -317,6 +318,7 @@
+             SlashCommand::Plan => {
+                 self.apply_plan_slash_command();
+             }
++            SlashCommand::Loop => self.handle_prompt_loop_command(""),
+             SlashCommand::Goal => {
+                 if !self.config.features.enabled(Feature::Goals) {
+                     return;
+@@ -600,6 +602,7 @@
+         args: String,
+         text_elements: Vec<TextElement>,
+     ) {
++        self.invalidate_quiet_loop();
+         if cmd != SlashCommand::Copy {
+             self.transcript.last_status_copy_targets = None;
+         }
+@@ -731,6 +734,7 @@
+         } = prepared;
+         let trimmed = args.trim();
+         match cmd {
++            SlashCommand::Loop => self.handle_prompt_loop_command(trimmed),
+             SlashCommand::Export if trimmed.is_empty() => self.show_transcript_export_popup(),
+             SlashCommand::Export => {
+                 self.set_queue_autosend_suppressed(/*suppressed*/ true);
+@@ -1184,6 +1188,7 @@
+             | SlashCommand::Rename
+             | SlashCommand::Voice
+             | SlashCommand::Recap
++            | SlashCommand::Loop
+             | SlashCommand::TestApproval => QueueDrain::Continue,
+             SlashCommand::Cd => match self.thread_id {
+                 Some(thread_id) if self.can_change_working_directory(thread_id) => QueueDrain::Stop,
+diff --git a/codex-rs/tui/src/chatwidget/tests/prompt_loop_tests.rs b/codex-rs/tui/src/chatwidget/tests/prompt_loop_tests.rs
+new file mode 100644
+index 0000000000..3fb7ba01aa
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/prompt_loop_tests.rs
+@@ -0,0 +1,417 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn prompt_loop_waits_for_idle_and_never_catches_up() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.handle_prompt_loop_command("5m check the build");
++    let now = Instant::now();
++    chat.turn_lifecycle.agent_turn_running = true;
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 900));
++    assert_no_submit_op(&mut op_rx);
++    chat.turn_lifecycle.agent_turn_running = false;
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 900));
++    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
++        panic!("expected user turn");
++    };
++    assert_eq!(
++        items,
++        vec![UserInput::Text {
++            text: "check the build".to_string(),
++            text_elements: vec![]
++        }]
++    );
++    // Even if turn-start hasn't arrived, another draw must not start a duplicate.
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 900));
++    assert_no_submit_op(&mut op_rx);
++}
++
++#[tokio::test]
++async fn prompt_loop_preserves_drafts_and_queued_messages() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.handle_prompt_loop_command("1m check CI");
++    chat.bottom_pane
++        .set_composer_text("my draft".to_string(), vec![], vec![]);
++    chat.tick_prompt_loop(Instant::now());
++    assert_no_submit_op(&mut op_rx);
++    assert_eq!(chat.bottom_pane.composer_text(), "my draft");
++    chat.bottom_pane
++        .set_composer_text(String::new(), vec![], vec![]);
++    chat.input_queue
++        .queued_user_messages
++        .push_back(UserMessage::from("user first").into());
++    chat.tick_prompt_loop(Instant::now());
++    assert_no_submit_op(&mut op_rx);
++}
++
++#[tokio::test]
++async fn prompt_loop_ends_on_cancel_expiry_thread_switch_and_shutdown() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    for ending in ["cancel", "expiry", "thread", "shutdown"] {
++        chat.handle_prompt_loop_command("1m check CI");
++        match ending {
++            "cancel" => chat.handle_prompt_loop_command("stop"),
++            "expiry" => {
++                chat.tick_prompt_loop(Instant::now() + Duration::from_secs(/*secs*/ 7 * 86_400))
++            }
++            "thread" => {
++                chat.thread_id = Some(ThreadId::new());
++                chat.tick_prompt_loop(Instant::now());
++            }
++            "shutdown" => chat.show_shutdown_in_progress(),
++            _ => unreachable!(),
++        }
++        assert!(chat.prompt_loop.is_none());
++        assert_no_submit_op(&mut op_rx);
++    }
++}
++
++#[tokio::test]
++async fn prompt_loop_commands_render_status_and_errors() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    for args in [
++        "status",
++        "0m check CI",
++        "999999999999999999999d check",
++        "5m check CI",
++        "status",
++        "90s check CI",
++        "status",
++        "stop",
++    ] {
++        chat.dispatch_command_with_args(SlashCommand::Loop, args.to_string(), vec![]);
++    }
++    let rendered = drain_insert_history(&mut rx)
++        .iter()
++        .map(|cell| lines_to_single_string(cell))
++        .collect::<Vec<_>>()
++        .join("\n");
++    insta::assert_snapshot!(rendered, @r"
++    • No active loop.
++    ■ Usage: /loop [interval] <prompt> | /loop status | /loop stop (interval: 1m–7d)
++    ■ Usage: /loop [interval] <prompt> | /loop status | /loop stop (interval: 1m–7d)
++    • Loop started · every 5m · expires in 7d
++    • Loop: every 5m · next in 0s · check CI
++    • Loop started · every 1m 30s · expires in 7d
++    • Loop: every 1m 30s · next in 0s · check CI
++    • Loop stopped.
++    ");
++}
++
++#[tokio::test]
++async fn prompt_loop_self_paced_requires_explicit_reschedule_and_rejects_stale_calls() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    chat.loop_tool_available = true;
++    chat.handle_prompt_loop_command("check CI");
++    let now = Instant::now();
++    chat.tick_prompt_loop(now);
++    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
++        panic!("expected turn");
++    };
++    let UserInput::Text { text, .. } = &items[0] else {
++        panic!("expected text");
++    };
++    let loop_id = text
++        .split("loopId: ")
++        .nth(/*n*/ 1)
++        .unwrap()
++        .split(')')
++        .next()
++        .unwrap()
++        .to_string();
++    chat.input_queue.user_turn_pending_start = false;
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 4_000));
++    assert_no_submit_op(&mut op_rx);
++    let schedule = serde_json::json!({"action":"schedule", "loopId":loop_id, "delaySeconds":120, "reason":"CI is running"});
++    assert!(
++        chat.apply_prompt_loop_action(&ThreadId::new().to_string(), "turn-loop", schedule.clone())
++            .is_err()
++    );
++    assert!(
++        chat.apply_prompt_loop_action(&thread_id.to_string(), "turn-loop", schedule)
++            .is_ok()
++    );
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 1));
++    assert_no_submit_op(&mut op_rx);
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 121));
++    next_submit_op(&mut op_rx);
++    chat.handle_prompt_loop_command("stop");
++    assert!(
++        chat.apply_prompt_loop_action(
++            &thread_id.to_string(),
++            "turn-loop",
++            serde_json::json!({"action":"stop", "loopId":loop_id})
++        )
++        .is_err()
++    );
++}
++
++#[tokio::test]
++async fn prompt_loop_self_paced_rejects_unsupported_sessions() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.handle_prompt_loop_command("check CI");
++    assert!(chat.prompt_loop.is_none());
++    let rendered = drain_insert_history(&mut rx)
++        .iter()
++        .map(|cell| lines_to_single_string(cell))
++        .collect::<Vec<_>>()
++        .join("\n");
++    insta::assert_snapshot!(rendered, @"■ The scheduling tool is unavailable for this conversation. Specify a fixed interval for /loop.");
++}
++
++#[tokio::test]
++async fn prompt_loop_uses_prepared_pasted_prompt() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    let prompt = "check the complete pasted CI report ".repeat(/*n*/ 40);
++    chat.bottom_pane
++        .set_composer_text("/loop 5m ".to_string(), vec![], vec![]);
++    chat.handle_paste(prompt.clone());
++    assert_eq!(chat.bottom_pane.composer_pending_pastes().len(), 1);
++    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++    chat.tick_prompt_loop(Instant::now());
++    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
++        panic!("expected turn");
++    };
++    assert_eq!(
++        items,
++        vec![UserInput::Text {
++            text: prompt.trim().to_string(),
++            text_elements: vec![]
++        }]
++    );
++}
++
++#[tokio::test]
++async fn prompt_loop_quiet_reports_preserve_fixed_cadence_and_wait_for_consolidation() {
++    let (mut chat, mut rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    chat.loop_tool_available = true;
++    chat.handle_prompt_loop_command("5m check CI");
++    let now = Instant::now();
++    chat.tick_prompt_loop(now);
++    let Op::UserTurn { items, .. } = next_submit_op(&mut ops) else {
++        panic!("expected loop turn");
++    };
++    let UserInput::Text { text, .. } = &items[0] else {
++        panic!("expected text");
++    };
++    let loop_id = text
++        .split("loopId: ")
++        .nth(/*n*/ 1)
++        .unwrap()
++        .split(')')
++        .next()
++        .unwrap();
++    chat.loop_turn_started("loop-turn");
++    let report = serde_json::json!({"action":"report","loopId":loop_id,"quiet":true,"reason":"CI still running"});
++    assert!(
++        chat.apply_prompt_loop_action(&thread_id.to_string(), "loop-turn", report)
++            .is_ok()
++    );
++    chat.note_stream_consolidation_queued();
++    chat.complete_quiet_loop("loop-turn", /*completed*/ true);
++    while let Ok(event) = rx.try_recv() {
++        assert!(!matches!(event, AppEvent::FinishQuietLoop { .. }));
++    }
++    chat.note_stream_consolidation_completed();
++    let summary = std::iter::from_fn(|| rx.try_recv().ok())
++        .find_map(|event| match event {
++            AppEvent::FinishQuietLoop { summary, .. } => Some(summary),
++            _ => None,
++        })
++        .unwrap();
++    let summary = summary.expect("quiet report retained");
++    assert!(summary.starts_with("Next loop in ") && summary.ends_with(" · CI still running"));
++    chat.input_queue.user_turn_pending_start = false;
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 299));
++    assert_no_submit_op(&mut ops);
++    chat.tick_prompt_loop(now + Duration::from_secs(/*secs*/ 301));
++    let Op::UserTurn { items, .. } = next_submit_op(&mut ops) else {
++        panic!("expected next fixed turn");
++    };
++    let UserInput::Text { text, .. } = &items[0] else {
++        panic!("expected text");
++    };
++    assert!(text.ends_with("check CI"));
++    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
++    assert!(events.iter().any(|event| matches!(
++        event,
++        AppEvent::BeginQuietLoop {
++            expected_users: 0,
++            ..
++        }
++    )));
++}
++
++#[tokio::test]
++async fn prompt_loop_echo_suppression_uses_client_and_turn_identity() {
++    let (mut chat, mut rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    chat.loop_tool_available = true;
++    chat.handle_prompt_loop_command("check CI");
++    chat.tick_prompt_loop(Instant::now());
++    let Op::UserTurn {
++        items,
++        client_user_message_id,
++        ..
++    } = next_submit_op(&mut ops)
++    else {
++        panic!("expected turn");
++    };
++    chat.loop_turn_started("loop-turn");
++    while rx.try_recv().is_ok() {}
++    chat.on_committed_user_message(
++        &items,
++        Some(&client_user_message_id),
++        /*from_replay*/ false,
++        "loop-turn",
++    );
++    assert!(rx.try_recv().is_err());
++    chat.on_committed_user_message(
++        &items,
++        Some("another-client"),
++        /*from_replay*/ false,
++        "loop-turn",
++    );
++    assert!(
++        std::iter::from_fn(|| rx.try_recv().ok())
++            .any(|event| matches!(event, AppEvent::InsertHistoryCell(_)))
++    );
++    assert!(!chat.is_loop_echo(Some(&client_user_message_id), "another-turn", ""));
++}
++
++#[tokio::test]
++async fn prompt_loop_only_matching_completed_quiet_turns_collapse() {
++    for mode in ["normal", "wrong-turn", "interrupted", "manual", "controls"] {
++        let (mut chat, mut rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
++        let thread_id = ThreadId::new();
++        chat.thread_id = Some(thread_id);
++        chat.loop_tool_available = true;
++        chat.handle_prompt_loop_command("check CI");
++        chat.tick_prompt_loop(Instant::now());
++        next_submit_op(&mut ops);
++        chat.loop_turn_started("loop-turn");
++        let prompt = &chat.quiet_loop_run.as_ref().unwrap().prompt;
++        let run_id = prompt
++            .split("loopId: ")
++            .nth(/*n*/ 1)
++            .unwrap()
++            .split(')')
++            .next()
++            .unwrap()
++            .to_string();
++        let mut report = serde_json::json!({"action":"schedule","loopId":run_id,"delaySeconds":120,"quiet":mode != "normal","reason":if mode == "controls" {"bad\nreason"} else {"unchanged"}});
++        if mode == "normal" {
++            report.as_object_mut().unwrap().remove("quiet");
++        }
++        if mode == "controls" {
++            chat.quiet_loop_run.as_mut().unwrap().summary = Some("earlier quiet report".into());
++        }
++        let result = chat.apply_prompt_loop_action(&thread_id.to_string(), "loop-turn", report);
++        assert_eq!(result.is_err(), mode == "controls");
++        if mode == "manual" {
++            chat.invalidate_quiet_loop();
++        }
++        chat.complete_quiet_loop(
++            if mode == "wrong-turn" {
++                "other"
++            } else {
++                "loop-turn"
++            },
++            /*completed*/ mode != "interrupted",
++        );
++        let summary = std::iter::from_fn(|| rx.try_recv().ok())
++            .find_map(|event| match event {
++                AppEvent::FinishQuietLoop { summary, .. } => Some(summary),
++                _ => None,
++            })
++            .unwrap();
++        assert_eq!(summary, None);
++    }
++}
++
++#[tokio::test]
++async fn prompt_loop_late_failures_and_manual_input_clear_verdict_before_consolidation_finishes() {
++    for mode in [
++        "error",
++        "manual",
++        "shell",
++        "mcp",
++        "mcp-status",
++        "patch",
++        "final-guard",
++    ] {
++        let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++        let thread_id = ThreadId::new();
++        chat.thread_id = Some(thread_id);
++        chat.quiet_loop_run = Some(super::super::quiet_loop::QuietLoopRun {
++            id: "run".into(),
++            thread_id,
++            turn_id: Some("loop-turn".into()),
++            client_id: Some("own-submit".into()),
++            prompt: "check CI".into(),
++            summary: Some("Next loop in 5m · unchanged".into()),
++            completed: false,
++            valid: true,
++        });
++        chat.note_stream_consolidation_queued();
++        chat.complete_quiet_loop("loop-turn", /*completed*/ true);
++        assert!(chat.quiet_loop_run.as_ref().unwrap().summary.is_some());
++        match mode {
++            "error" => chat.add_error_message("late failure".into()),
++            "manual" => chat.submit_user_message(UserMessage::from("manual follow-up")),
++            "shell" => chat.submit_user_message(UserMessage::from("!echo manual")),
++            "mcp" | "mcp-status" => {
++                chat.handle_mcp_tool_call_completed_now(ThreadItem::McpToolCall {
++                    id: "failed-call".into(),
++                    server: "test-server".into(),
++                    tool: "check".into(),
++                    status: codex_app_server_protocol::McpToolCallStatus::Failed,
++                    arguments: serde_json::json!({}),
++                    app_context: None,
++                    mcp_app_resource_uri: None,
++                    plugin_id: None,
++                    read_only_hint: None,
++                    result: (mode == "mcp-status").then(|| {
++                        Box::new(codex_app_server_protocol::McpToolCallResult {
++                            content: Vec::new(),
++                            structured_content: None,
++                            meta: None,
++                        })
++                    }),
++                    error: None,
++                    duration_ms: Some(1),
++                })
++            }
++            "patch" => chat.handle_file_change_completed_now(ThreadItem::FileChange {
++                id: "failed-patch".into(),
++                changes: Vec::new(),
++                status: codex_app_server_protocol::PatchApplyStatus::Failed,
++            }),
++            // The emission guard must also reject an already-invalid stale verdict.
++            "final-guard" => chat.quiet_loop_run.as_mut().unwrap().valid = false,
++            _ => unreachable!(),
++        }
++        if mode != "final-guard" {
++            assert!(chat.quiet_loop_run.as_ref().unwrap().summary.is_none());
++        }
++        chat.note_stream_consolidation_completed();
++        let verdict = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
++            AppEvent::FinishQuietLoop { summary, .. } => Some(summary),
++            _ => None,
++        });
++        assert_eq!(verdict, Some(None));
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+index c7aaa1a7a5..e9abea3191 100644
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -265,6 +265,8 @@
+ #[path = "tests/plugin_catalog_tests.rs"]
+ mod plugin_catalog;
+ mod popups_and_settings;
++#[path = "tests/prompt_loop_tests.rs"]
++mod prompt_loop_tests;
+ #[path = "tests/rate_limit_recovery_tests.rs"]
+ mod rate_limit_recovery_tests;
+ #[path = "tests/reasoning_status_tests.rs"]
+diff --git a/codex-rs/tui/src/chatwidget/tokens.rs b/codex-rs/tui/src/chatwidget/tokens.rs
+index 52db0a60f6..db125bf2ad 100644
+--- a/codex-rs/tui/src/chatwidget/tokens.rs
++++ b/codex-rs/tui/src/chatwidget/tokens.rs
+@@ -239,6 +239,7 @@
+     pub(crate) fn note_stream_consolidation_completed(&mut self) {
+         self.pending_stream_consolidations =
+             self.pending_stream_consolidations.saturating_sub(/*rhs*/ 1);
++        self.finish_quiet_loop_if_ready();
+     }
+ 
+     /// Transfers the completed token activity card into the history insertion path.
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index d8ff1c61d3..23e026c271 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -157,6 +157,7 @@
+         // If the patch was successful, just let the "Edited" block stand.
+         // Otherwise, add a failure block.
+         if matches!(status, codex_app_server_protocol::PatchApplyStatus::Failed) {
++            self.invalidate_quiet_loop();
+             self.add_to_history(history_cell::new_patch_apply_failure(String::new()));
+         }
+     }
+@@ -236,6 +237,12 @@
+             (None, None) => Err("MCP tool call completed without a result".to_string()),
+         };
+ 
++        if match &result {
++            Ok(result) => result.is_error == Some(true),
++            Err(_) => true,
++        } {
++            self.invalidate_quiet_loop();
++        }
+         if invocation.is_computer_activity() {
+             let call = history_cell::new_active_mcp_tool_call(
+                 id,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 4e34536699..43a1f80833 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -365,6 +365,10 @@
+ mod hook_lifecycle;
+ mod hooks;
+ mod interaction;
++#[cfg(unix)]
++mod local_control;
++mod prompt_loop;
++mod quiet_loop;
+ mod skills;
+ mod slash_dispatch;
+ mod worktree_picker;
+@@ -594,6 +598,9 @@
+     session_telemetry: SessionTelemetry,
+     session_header: SessionHeader,
+     initial_user_message: Option<UserMessage>,
++    prompt_loop: Option<prompt_loop::PromptLoop>,
++    quiet_loop_run: Option<quiet_loop::QuietLoopRun>,
++    pub(crate) loop_tool_available: bool,
+     status_account_display: Option<StatusAccountDisplay>,
+     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
+     pub(crate) local_worktree_operations: bool,
+@@ -1328,6 +1335,9 @@
+             return;
+         }
+         let display = Self::user_message_display_from_inputs(items);
++        if !from_replay && self.is_loop_echo(client_id, turn_id, &display.message) {
++            return;
++        }
+         if from_replay {
+             if self.review.is_review_mode {
+                 return;
+@@ -1408,6 +1418,7 @@
+     }
+ 
+     pub(crate) fn show_shutdown_in_progress(&mut self) {
++        self.prompt_loop = None;
+         self.bottom_pane.show_shutdown_in_progress();
+     }
+ 
+@@ -1574,6 +1585,7 @@
+     }
+ 
+     pub(crate) fn add_error_message(&mut self, message: String) {
++        self.invalidate_quiet_loop();
+         self.add_to_history(history_cell::new_error_event(message));
+         self.request_redraw();
+     }
+diff --git a/codex-rs/tui/src/dynamic_tools.rs b/codex-rs/tui/src/dynamic_tools.rs
+index 8633fdaf58..001023993d 100644
+--- a/codex-rs/tui/src/dynamic_tools.rs
++++ b/codex-rs/tui/src/dynamic_tools.rs
+@@ -634,7 +634,7 @@
+             if let Some(model) = arguments.model {
+                 thread_start_params.model = Some(model);
+             }
+-            let (started, _, task_tools_available) =
++            let (started, _, task_tools_available, _) =
+                 crate::app_server_session::request_thread_start_with_history_fallback(
+                     &handle,
+                     RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4())),
+diff --git a/codex-rs/tui/src/dynamic_tools_mcp.rs b/codex-rs/tui/src/dynamic_tools_mcp.rs
+index 92d701f8d6..1ab7c62183 100644
+--- a/codex-rs/tui/src/dynamic_tools_mcp.rs
++++ b/codex-rs/tui/src/dynamic_tools_mcp.rs
+@@ -69,6 +69,10 @@
+                 self.configure_mcp(&mut params.config);
+             }
+         }
++        params
++            .dynamic_tools
++            .get_or_insert_default()
++            .push(crate::prompt_loop_tool::tool_spec());
+     }
+ 
+     pub(crate) fn configure_mcp(&self, config: &mut Option<HashMap<String, Value>>) {
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+index bcbcd8dc1c..14ad9193cf 100644
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -112,6 +112,7 @@
+ mod notices;
+ mod patches;
+ mod plans;
++mod quiet_loop;
+ mod request_user_input;
+ mod search;
+ mod separators;
+@@ -130,6 +131,8 @@
+ pub(crate) use notices::*;
+ pub(crate) use patches::*;
+ pub(crate) use plans::*;
++pub(crate) use quiet_loop::QuietLoopCell;
++pub(crate) use quiet_loop::QuietLoopPromptCell;
+ pub(crate) use request_user_input::*;
+ pub(crate) use search::*;
+ pub(crate) use separators::*;
+diff --git a/codex-rs/tui/src/history_cell/quiet_loop.rs b/codex-rs/tui/src/history_cell/quiet_loop.rs
+new file mode 100644
+index 0000000000..718a39f7e1
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/quiet_loop.rs
+@@ -0,0 +1,122 @@
++//! Compact automatic checks retain their complete transcript for Ctrl+T.
++use super::*;
++use std::sync::Arc;
++
++#[derive(Debug)]
++pub(crate) struct QuietLoopCell {
++    summary: String,
++    children: Vec<Arc<dyn HistoryCell>>,
++    first_prompt: Option<Arc<dyn HistoryCell>>,
++}
++
++impl QuietLoopCell {
++    pub(crate) fn bounded(
++        summary: String,
++        children: Vec<Arc<dyn HistoryCell>>,
++        expected_users: usize,
++    ) -> Option<Self> {
++        if summary.len() > 256
++            || summary.chars().any(char::is_control)
++            || children.len() > 64
++            || children
++                .iter()
++                .filter(|cell| cell.as_any().is::<UserHistoryCell>())
++                .count()
++                != expected_users
++        {
++            return None;
++        }
++        if children.iter().any(|cell| {
++            cell.as_any()
++                .downcast_ref::<crate::exec_cell::ExecCell>()
++                .is_some_and(|exec| {
++                    exec.calls.iter().any(|call| {
++                        call.source == codex_app_server_protocol::CommandExecutionSource::UserShell
++                            || call
++                                .output
++                                .as_ref()
++                                .is_none_or(|output| output.exit_code != 0)
++                    })
++                })
++        }) {
++            return None;
++        }
++        let mut bytes = 0usize;
++        for cell in &children {
++            for line in cell.transcript_lines(u16::MAX) {
++                bytes = bytes.saturating_add(1);
++                if bytes > 65_536 {
++                    return None;
++                }
++                for span in line.spans {
++                    bytes = bytes.saturating_add(span.content.len());
++                    if bytes > 65_536 {
++                        return None;
++                    }
++                }
++            }
++        }
++        let first_prompt = children
++            .iter()
++            .find(|cell| cell.as_any().is::<UserHistoryCell>())
++            .cloned();
++        Some(Self {
++            summary,
++            children,
++            first_prompt,
++        })
++    }
++}
++
++impl HistoryCell for QuietLoopCell {
++    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
++        let (text, _, _) = crate::live_wrap::take_prefix_by_width(&self.summary, width as usize);
++        let mut lines = self
++            .first_prompt
++            .as_ref()
++            .map(|cell| cell.display_lines(width))
++            .unwrap_or_default();
++        lines.push(Line::from(text).dim());
++        lines
++    }
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        let mut lines = self
++            .first_prompt
++            .as_ref()
++            .map(|cell| cell.raw_lines())
++            .unwrap_or_default();
++        lines.push(self.summary.clone().into());
++        lines
++    }
++    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
++        self.children
++            .iter()
++            .flat_map(|cell| cell.transcript_lines(width))
++            .collect()
++    }
++    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
++        self.children
++            .iter()
++            .flat_map(|cell| cell.transcript_hyperlink_lines(width))
++            .collect()
++    }
++}
++
++#[cfg(test)]
++#[path = "quiet_loop_tests.rs"]
++mod tests;
++
++/// Repeated automatic prompts remain available in Ctrl+T without filling scrollback.
++#[derive(Debug)]
++pub(crate) struct QuietLoopPromptCell(pub(crate) UserHistoryCell);
++impl HistoryCell for QuietLoopPromptCell {
++    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
++        Vec::new()
++    }
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        Vec::new()
++    }
++    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
++        self.0.transcript_lines(width)
++    }
++}
+diff --git a/codex-rs/tui/src/history_cell/quiet_loop_tests.rs b/codex-rs/tui/src/history_cell/quiet_loop_tests.rs
+new file mode 100644
+index 0000000000..fdec682645
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/quiet_loop_tests.rs
+@@ -0,0 +1,145 @@
++use super::*;
++use insta::assert_snapshot;
++use pretty_assertions::assert_eq;
++
++fn plain(text: &str) -> Arc<dyn HistoryCell> {
++    Arc::new(PlainHistoryCell::new(vec![text.to_string().into()]))
++}
++fn text(lines: Vec<Line<'static>>) -> String {
++    lines
++        .iter()
++        .map(|line| {
++            line.spans
++                .iter()
++                .map(|span| span.content.as_ref())
++                .collect::<String>()
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++#[test]
++fn quiet_loop_keeps_full_transcript_while_inline_stays_compact_after_resize() {
++    let cell = QuietLoopCell::bounded(
++        "Next loop in 5m · CI still running".into(),
++        vec![plain("Checked CI"), plain("Still running")],
++        /*expected_users*/ 0,
++    )
++    .unwrap();
++    assert_snapshot!(text(cell.display_lines(/*width*/ 80)), @"Next loop in 5m · CI still running");
++    assert_snapshot!(text(cell.display_lines(/*width*/ 20)), @"Next loop in 5m · CI");
++    assert_eq!(
++        text(cell.transcript_lines(/*width*/ 80)),
++        "Checked CI\nStill running"
++    );
++    assert_eq!(
++        text(cell.transcript_lines(/*width*/ 20)),
++        "Checked CI\nStill running"
++    );
++}
++
++#[test]
++fn quiet_loop_rejects_caps_controls_and_manual_user_interleaving() {
++    let summary = "Next loop in 5m · unchanged";
++    assert!(
++        QuietLoopCell::bounded(
++            summary.into(),
++            vec![plain("x"); 65],
++            /*expected_users*/ 0
++        )
++        .is_none()
++    );
++    assert!(
++        QuietLoopCell::bounded(
++            summary.into(),
++            vec![plain(&"x".repeat(/*n*/ 65_537))],
++            /*expected_users*/ 0
++        )
++        .is_none()
++    );
++    assert!(
++        QuietLoopCell::bounded("bad\nsummary".into(), Vec::new(), /*expected_users*/ 0).is_none()
++    );
++    let user: Arc<dyn HistoryCell> = Arc::new(new_user_prompt(
++        "manual input".into(),
++        Vec::new(),
++        Vec::new(),
++        Vec::new(),
++    ));
++    assert!(
++        QuietLoopCell::bounded(
++            summary.into(),
++            vec![user.clone()],
++            /*expected_users*/ 0
++        )
++        .is_none()
++    );
++    assert!(
++        QuietLoopCell::bounded(
++            summary.into(),
++            vec![user.clone(), user],
++            /*expected_users*/ 1
++        )
++        .is_none()
++    );
++}
++
++#[test]
++fn quiet_loop_first_run_keeps_original_task_visible() {
++    let task: Arc<dyn HistoryCell> = Arc::new(new_user_prompt(
++        "check CI".into(),
++        Vec::new(),
++        Vec::new(),
++        Vec::new(),
++    ));
++    let cell = QuietLoopCell::bounded(
++        "Next loop in 5m · unchanged".into(),
++        vec![task, plain("No change")],
++        /*expected_users*/ 1,
++    )
++    .unwrap();
++    let inline = text(cell.display_lines(/*width*/ 80));
++    assert!(inline.contains("check CI"));
++    assert!(inline.contains("Next loop in 5m"));
++    assert!(!inline.contains("No change"));
++    assert!(text(cell.transcript_lines(/*width*/ 80)).contains("No change"));
++}
++
++#[test]
++fn quiet_loop_keeps_manual_and_incomplete_exec_activity_expanded() {
++    use crate::exec_cell::ExecCall;
++    use crate::exec_cell::ExecCell;
++    use codex_app_server_protocol::CommandExecutionSource;
++    for (source, output) in [
++        (
++            CommandExecutionSource::UserShell,
++            Some(crate::exec_cell::CommandOutput::new(
++                /*exit_code*/ 0,
++                "manual output".into(),
++            )),
++        ),
++        (CommandExecutionSource::Agent, None),
++    ] {
++        let cell: Arc<dyn HistoryCell> = Arc::new(ExecCell::new(
++            ExecCall {
++                call_id: "call".into(),
++                command: vec!["echo".into()],
++                parsed: Vec::new(),
++                output,
++                source,
++                start_time: None,
++                duration: Some(Duration::ZERO),
++                interaction_input: None,
++            },
++            /*animations_enabled*/ false,
++        ));
++        assert!(
++            QuietLoopCell::bounded(
++                "Next loop in 5m · unchanged".into(),
++                vec![cell],
++                /*expected_users*/ 0
++            )
++            .is_none()
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 43591eceed..7dc12d075f 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -154,6 +154,7 @@
+ mod ide_context;
+ mod inline_visualization;
+ pub(crate) mod insert_history;
++mod prompt_loop_tool;
+ pub use insert_history::insert_history_lines;
+ mod footer_hint;
+ mod key_hint;
+diff --git a/codex-rs/tui/src/prompt_loop_tool.rs b/codex-rs/tui/src/prompt_loop_tool.rs
+new file mode 100644
+index 0000000000..bbf7a42e29
+--- /dev/null
++++ b/codex-rs/tui/src/prompt_loop_tool.rs
+@@ -0,0 +1,66 @@
++//! Client-local scheduling control for a user-started self-paced loop.
++use codex_app_server_protocol::DynamicToolCallOutputContentItem;
++use codex_app_server_protocol::DynamicToolCallResponse;
++use codex_app_server_protocol::DynamicToolFunctionSpec;
++use codex_app_server_protocol::DynamicToolSpec;
++use serde::Deserialize;
++use serde_json::json;
++
++pub(crate) const TOOL_NAME: &str = "schedule_loop";
++
++#[derive(Deserialize)]
++#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
++pub(crate) enum LoopAction {
++    Schedule {
++        #[serde(rename = "loopId")]
++        loop_id: String,
++        #[serde(rename = "delaySeconds")]
++        delay_seconds: u64,
++        reason: String,
++        #[serde(default)]
++        quiet: bool,
++    },
++    Report {
++        #[serde(rename = "loopId")]
++        loop_id: String,
++        reason: String,
++        #[serde(default)]
++        quiet: bool,
++    },
++    Stop {
++        #[serde(rename = "loopId")]
++        loop_id: String,
++    },
++}
++
++pub(crate) fn tool_spec() -> DynamicToolSpec {
++    DynamicToolSpec::Function(DynamicToolFunctionSpec {
++        name: TOOL_NAME.to_string(),
++        description: "Control a user-started /loop in this terminal session. For fixed loops, report each check with action report and a concise reason; this preserves cadence. Set quiet=true only when nothing meaningful changed. After each self-paced run, schedule the next run in 60–3600 seconds with a concise reason, or stop when the task is done. Use the loopId supplied with the prompt. Cannot create loops. Scheduling never interrupts a busy turn. End your current turn after scheduling.".to_string(),
++        input_schema: json!({
++            "type": "object",
++            "properties": {
++                "action": {"type": "string", "enum": ["schedule", "report", "stop"]},
++                "loopId": {"type": "string"},
++                "delaySeconds": {"type": "integer", "minimum": 60, "maximum": 3600},
++                "quiet": {"type": "boolean", "description": "True only if nothing meaningful changed; collapse this check in terminal history."},
++                "reason": {"type": "string", "minLength": 1, "maxLength": 200}
++            },
++            "required": ["action", "loopId"],
++            "additionalProperties": false
++        }),
++        defer_loading: false,
++    })
++}
++
++pub(crate) fn response(result: Result<String, String>) -> DynamicToolCallResponse {
++    let success = result.is_ok();
++    DynamicToolCallResponse {
++        content_items: vec![DynamicToolCallOutputContentItem::InputText {
++            text: match result {
++                Ok(text) | Err(text) => text,
++            },
++        }],
++        success,
++    }
++}
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index 99fea9eee7..a28f7e108f 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -41,6 +41,7 @@
+     Plan,
+     Voice,
+     Goal,
++    Loop,
+     Agents,
+     Side,
+     Btw,
+@@ -131,6 +132,7 @@
+             SlashCommand::Plan => "switch to Plan mode",
+             SlashCommand::Voice => "start or stop a live voice conversation",
+             SlashCommand::Goal => "set or view the goal for a long-running task",
++            SlashCommand::Loop => "repeat a prompt on an interval, or stop a loop",
+             SlashCommand::Agents => "view and switch between all active agent sessions",
+             SlashCommand::MultiAgents => "switch between this session's subagents",
+             SlashCommand::Side | SlashCommand::Btw => {
+@@ -169,6 +171,7 @@
+                 | SlashCommand::Fork
+                 | SlashCommand::Plan
+                 | SlashCommand::Goal
++                | SlashCommand::Loop
+                 | SlashCommand::Voice
+                 | SlashCommand::Ide
+                 | SlashCommand::Keymap
+@@ -246,6 +249,7 @@
+             | SlashCommand::Stop
+             | SlashCommand::App
+             | SlashCommand::Goal
++            | SlashCommand::Loop
+             | SlashCommand::Voice
+             | SlashCommand::Mcp
+             | SlashCommand::Apps

@@ -8,6 +8,7 @@ Focused functionality patches for [Codex CLI](https://github.com/openai/codex), 
 | [Heads Up](patches/0002-heads-up.patch) | Optional independent conversation reviewer, persistent notes, full explanations, known topics, editable discussion drafts, and direct send. Includes `tui.heads_up_expanded`. | Steering patch |
 | [Background command wakeups](patches/0003-background-command-wakeups.patch) | Ends `clock.sleep` early when a background command finishes, returning its session ID and status. | Base; independent of the other patches |
 | [Review ranges](patches/0004-review-ranges.patch) | Adds Git commit ranges and JJ revsets to `codex review`, with optional focus instructions. | Base; independent of the other patches |
+| [Prompt loops](patches/0005-loop.patch) | `/loop` repeats a prompt while the session is idle; the model can pick its next check with a local scheduling tool, schedules reattach on resume and fork, and unchanged automated runs collapse into one quiet entry. | Base; independent of the other patches. Run `just write-app-server-schema` and `just write-app-server-schema --experimental` after applying to regenerate the precomputed schema exports. |
 
 The native Heads Up patch includes core and app-server integration, TUI rendering, generated API/schema artifacts, tests, and snapshots. It retains the parent's prompt prefix and disables tool execution for the review. Reviews run separately from the main turn, with bounded retries and output; results enter the conversation only through an explicit user action.
 
@@ -35,9 +36,11 @@ git apply --check ../codex-patches/patches/0003-background-command-wakeups.patch
 git apply ../codex-patches/patches/0003-background-command-wakeups.patch
 git apply --check ../codex-patches/patches/0004-review-ranges.patch
 git apply ../codex-patches/patches/0004-review-ranges.patch
+git apply --check ../codex-patches/patches/0005-loop.patch
+git apply ../codex-patches/patches/0005-loop.patch
 ```
 
-[`series`](series) records this order. Steering, background command wakeups, and review ranges can each be used independently. Heads Up depends on steering so “Send to agent” also steers during the pending-start interval.
+[`series`](series) records this order. Steering, background command wakeups, review ranges, and prompt loops can each be used independently. Heads Up depends on steering so “Send to agent” also steers during the pending-start interval.
 
 Build Codex using its normal build instructions after applying the patches.
 

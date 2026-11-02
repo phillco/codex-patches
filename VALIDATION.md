@@ -71,3 +71,10 @@ just fix -p codex-exec
 ```
 
 The standalone tests use the same macOS Studio runner described above; full workspace and Windows/Linux validation were not performed.
+
+## Prompt loops
+
+- Patch `0005` is a squash of the loop feature (`/loop`, the local scheduling tool, resume and fork reattachment, quiet collapsed runs, and registration-failure handling) and applies independently to `BASE`: 54 files, 2,506 insertions, 69 deletions. `git apply --check` passes against a fresh index at `BASE`.
+- The patch contains no references to Heads Up or other fork-only code. It does not retain a loop when the user switches conversations; a loop belongs to the active conversation.
+- The precomputed compressed schema exports (`app-server-exports-stable.json.zst`, `app-server-exports-experimental.json.zst`) are not included. Regenerate them after applying with `just write-app-server-schema` and `just write-app-server-schema --experimental`. The plain JSON schemas the change alters are included.
+- **Not performed:** compiling the extracted patch, running its tests, formatting and lint checks, and interactive UI testing. The loop tests exist in the patch but have not been run against the standalone extraction.
